@@ -1,14 +1,15 @@
-# [ICPR 2024] SuperSimpleNet
+# SuperSimpleNet
 
- 	
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/2408-03143/supervised-defect-detection-on-kolektorsdd2)](https://paperswithcode.com/sota/supervised-defect-detection-on-kolektorsdd2?p=2408-03143)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/2408-03143/supervised-defect-detection-on-sensumsodf)](https://paperswithcode.com/sota/supervised-defect-detection-on-sensumsodf?p=2408-03143)
+Official implementation of SuperSimpleNet.
 
-Official implementation of [SuperSimpleNet : Unifying Unsupervised and Supervised Learning for Fast and Reliable Surface Defect Detection](https://arxiv.org/abs/2408.03143) - ICPR 2024.
+Original: [SuperSimpleNet : Unifying Unsupervised and Supervised Learning for Fast and Reliable Surface Defect Detection](https://arxiv.org/abs/2408.03143) - ICPR 2024.
+
+Extension to mixed supervision: No Label Left Behind: A Unified Surface Defect Detection Model for all Supervision Regimes - JIMS 2025.
+(:warning: Will be available soon - repository is still being refactored for this latest version :warning:).
 
 ---
 
-Unsupervised version of SuperSimpleNet is also available in [Anomalib](https://github.com/open-edge-platform/anomalib).
+Unsupervised ICPR version of SuperSimpleNet is also available in [Anomalib](https://github.com/open-edge-platform/anomalib).
 
 ## Environment
 ```bash
@@ -73,10 +74,16 @@ Extract them into `./weights` path and ensure they are all inside a directory wi
 ./weights/
    0/
       ksdd2/
+         ksdd2/
+            <ratio> (e.g. 246)/
+               weights.pt
       sensum/
       mvtec/
       visa/
 ```
+
+The original ICPR checkpoints don't have the `ratio` subdirectory, 
+while the latest JIMS version also has ratio subdirectory for each mixed supervision scenario.
 
 We report an average of 5 runs in our paper, but the weights from the link are only for the best run.
 Therefore, the results won't exactly match the ones reported in the paper.
@@ -109,7 +116,10 @@ Slurm script `run_slurm_train.sh` is also provided to execute training on a slur
 
 ---
 
-Config for the model and datasets is contained within train.py file. If you want to modify training params, change the values there. 
+Config for the model and datasets is contained within train.py file. If you want to modify training params, change the values there.
+
+**The ICPR and JIMS versions mostly differ in 3 parameters:** 
+`dt` (distance transform), `dilate` (label dilation), and `adapt_cls_feat` (use adapted features for cls head or not).
 
 We recommend taking the MVTec parameters when training on your own **unsupervised** dataset and SenumSODF parameters for **supervised** dataset.
 
@@ -129,12 +139,21 @@ We also include the performance results from the paper inside `paper_results`.
 
 ## Citation
 
+If you find our work useful, please cite our works:
+
 ```bibtex
 @InProceedings{rolih2024supersimplenet,
   author={Rolih, Bla{\v{z}} and Fu{\v{c}}ka, Matic and Sko{\v{c}}aj, Danijel},
   booktitle={International Conference on Pattern Recognition}, 
   title={{S}uper{S}imple{N}et: {U}nifying {U}nsupervised and {S}upervised {L}earning for {F}ast and {R}eliable {S}urface {D}efect {D}etection},
   year={2024}
+}
+
+@article{rolih2025supersimplenet2,
+  author={Rolih, Bla{\v{z}} and Fu{\v{c}}ka, Matic and Sko{\v{c}}aj, Danijel},
+  journal={Journal of Intelligent Manufacturing}, 
+  title={No Label Left Behind: A Unified Surface Defect Detection Model for all Supervision Regimes},
+  year={2025}
 }
 ```
 
