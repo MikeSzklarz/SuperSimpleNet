@@ -12,6 +12,7 @@ import pandas as pd
 from common.results_writer import ResultsWriter
 from common.visualizer import Visualizer
 from datamodules import sensum, ksdd2
+from datamodules.base import Supervision
 from datamodules.mvtec import MVTec
 from datamodules.visa import Visa
 from datamodules.ksdd2 import KSDD2
@@ -177,6 +178,7 @@ def get_sensum(config):
                 train_batch_size=config["batch"],
                 eval_batch_size=config["batch"],
                 num_workers=config["num_workers"],
+                supervision=Supervision.MIXED_SUPERVISION,
                 ratio_segmented=sensum.RatioSegmented.M100,
                 seed=config["seed"],
                 flips=False,
@@ -193,6 +195,7 @@ def get_ksdd2(config):
         train_batch_size=config["batch"],
         eval_batch_size=config["batch"],
         num_workers=config["num_workers"],
+        supervision=Supervision.MIXED_SUPERVISION,
         num_segmented=ksdd2.NumSegmented.N246,
         seed=config["seed"],
         flips=False,
@@ -370,6 +373,9 @@ def run_eval(datasets, run_id):
         "batch": 8,
         "num_workers": 8,
         "run_id": str(run_id),
+        # "ratio": "1", # configured below in the loop if using extended version
+        "adapt_cls_feat": False,  # (JIMS extension) cls features are not adapted
+        # "adapt_cls_feat": True,
     }
     data_functions = {
         "sensum": get_sensum,
@@ -379,6 +385,13 @@ def run_eval(datasets, run_id):
     }
 
     for dataset in datasets:
+        # extended SSN (JIMS version)
+        if dataset == "ksdd2":
+            # ksdd2 has num segmented instead of ratio
+            config["ratio"] = "246"
+        else:
+            config["ratio"] = "1"
+
         data_list = data_functions[dataset](config)
 
         results_writer = ResultsWriter(
@@ -397,7 +410,12 @@ def run_eval(datasets, run_id):
         for cat, datamodule in data_list:
             print("Evaluating", f"{dataset}-{cat}")
             weight_path = (
-                config["weights_path"] / config["run_id"] / dataset / cat / "weights.pt"
+                config["weights_path"]
+                / config["run_id"]
+                / dataset
+                / cat
+                / config["ratio"]
+                / "weights.pt"
             )
             model = SuperSimpleNet(image_size=datamodule.image_size, config=config)
             model.load_model(weight_path)
@@ -449,10 +467,11 @@ def run_eval(datasets, run_id):
 
 
 if __name__ == "__main__":
-    run_eval(datasets=["mvtec", "visa", "ksdd2", "sensum"], run_id=0)
+    datasets = ["mvtec", "visa", "ksdd2", "sensum"]
+    run_eval(datasets=datasets, run_id=0)
     # to get mean and std of multiple runs, specify them with run_ids
     generate_result_json(
         run_ids=["0"],
-        datasets=["mvtec", "visa", "ksdd2", "sensum"],
+        datasets=datasets,
         res_path=Path("./eval_res"),
     )
