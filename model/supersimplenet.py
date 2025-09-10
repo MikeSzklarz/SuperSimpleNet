@@ -38,6 +38,8 @@ class SuperSimpleNet(nn.Module):
         self.fh = fh
         self.fw = fw
         self.feature_adaptor = FeatureAdaptor(projection_dim=fc)
+        self.adapt_cls_feat = config.get("adapt_cls_feat", False)
+
         self.discriminator = Discriminator(
             projection_dim=fc,
             hidden_dim=1024,
@@ -69,20 +71,42 @@ class SuperSimpleNet(nn.Module):
         features = self.feature_extractor(images)
         adapted = self.feature_adaptor(features)
 
+        seg_feats = adapted
+        if self.adapt_cls_feat:
+            # ICPR SuperSimpleNet - cls and seg both use adapted feat
+            cls_feats = adapted
+        else:
+            # extension SuperSimpleNet - adapt only seg feats
+            cls_feats = features
+
         if self.training:
             # add noise to features
             if self.config["noise"]:
                 # also returns adjusted labels and masks
-                final_features, mask, label = self.anomaly_generator(
-                    adapted, mask, label
-                )
-            else:
-                final_features = adapted
+                if self.adapt_cls_feat:
+                    # ICPR SuperSimpleNet - add noise to adapted only (since non-adapted are not used)
+                    _, noised_adapt, mask, label = self.anomaly_generator(
+                        features=None, adapted=adapted, mask=mask, labels=label
+                    )
+                    seg_feats = noised_adapt
+                    cls_feats = noised_adapt
+                else:
+                    # extension of SuperSimpleNet - add (same) noise to adapted and features
+                    noised_feat, noised_adapt, mask, label = self.anomaly_generator(
+                        features=features, adapted=adapted, mask=mask, labels=label
+                    )
+                    seg_feats = noised_adapt
+                    cls_feats = noised_feat
 
-            anomaly_map, anomaly_score = self.discriminator(final_features)
+            anomaly_map, anomaly_score = self.discriminator(
+                seg_features=seg_feats, cls_features=cls_feats
+            )
             return anomaly_map, anomaly_score, mask, label
         else:
-            anomaly_map, anomaly_score = self.discriminator(adapted)
+            anomaly_map, anomaly_score = self.discriminator(
+                seg_features=seg_feats, cls_features=cls_feats
+            )
+
             anomaly_map = self.anomaly_map_generator(anomaly_map)
 
             return anomaly_map, anomaly_score
@@ -217,15 +241,17 @@ class Discriminator(nn.Module):
         dec_params = list(self.dec_head.parameters()) + list(self.fc_score.parameters())
         return seg_params, dec_params
 
-    def forward(self, input: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self, seg_features: Tensor, cls_features: Tensor
+    ) -> tuple[Tensor, Tensor]:
         # get anomaly map from seg head
-        map = self.seg(input)
+        map = self.seg(seg_features)
 
         map_dec_copy = map
         if self.stop_grad:
             map_dec_copy = map_dec_copy.detach()
         # dec conv layer takes feat + map
-        mask_cat = torch.cat((input, map_dec_copy), dim=1)
+        mask_cat = torch.cat((cls_features, map_dec_copy), dim=1)
         dec_out = self.dec_head(mask_cat)
 
         dec_max = self.dec_max_pool(dec_out)
@@ -337,27 +363,30 @@ class AnomalyGenerator(nn.Module):
         return torch.cat(perlin)
 
     def forward(
-        self, input: Tensor, mask: Tensor, labels: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        self, features: Tensor | None, adapted: Tensor, mask: Tensor, labels: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         b, _, h, w = mask.shape
 
         # duplicate
-        input = torch.cat((input, input))
+        adapted = torch.cat((adapted, adapted))
         mask = torch.cat((mask, mask))
         labels = torch.cat((labels, labels))
+        # extended ssn case where cls gets non-adapted
+        if features is not None:
+            features = torch.cat((features, features))
 
         noise = torch.normal(
             mean=self.noise_mean,
             std=self.noise_std,
-            size=input.shape,
-            device=input.device,
+            size=adapted.shape,
+            device=adapted.device,
             requires_grad=False,
         )
 
         # mask indicating which regions will have noise applied
         # [B * 2, 1, H, W] initial all masked as anomalous
         noise_mask = torch.ones(
-            b * 2, 1, h, w, device=input.device, requires_grad=False
+            b * 2, 1, h, w, device=adapted.device, requires_grad=False
         )
 
         if not self.config["bad"]:
@@ -372,7 +401,7 @@ class AnomalyGenerator(nn.Module):
 
         if self.config["perlin"]:
             # [B * 2, 1, H, W]
-            perlin_mask = self.generate_perlin(b * 2).to(input.device)
+            perlin_mask = self.generate_perlin(b * 2).to(adapted.device)
             # if perlin only apply where perlin mask is 1
             noise_mask = noise_mask * perlin_mask
         else:
@@ -391,9 +420,13 @@ class AnomalyGenerator(nn.Module):
         labels = torch.where(labels > 0, 1, 0)
 
         # apply masked noise
-        perturbed = input + noise * noise_mask
+        perturbed_adapt = adapted + noise * noise_mask
+        if features is not None:
+            perturbed_feat = features + noise * noise_mask
+        else:
+            perturbed_feat = None
 
-        return perturbed, mask, labels
+        return perturbed_feat, perturbed_adapt, mask, labels
 
 
 class AnomalyMapGenerator(nn.Module):

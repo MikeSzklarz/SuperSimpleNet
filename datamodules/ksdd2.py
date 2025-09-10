@@ -8,6 +8,7 @@ import numpy as np
 from anomalib.data.utils import Split, LabelName, InputNormalizationMethod
 from pandas import DataFrame
 
+from datamodules.base import segmented2segmented, Supervision
 from datamodules.base.datamodule import SSNDataModule
 from datamodules.base.dataset import SSNDataset
 
@@ -25,17 +26,37 @@ def get_default_resolution():
 
 
 def read_split(
-    root: Path, num_segmented: NumSegmented, split: Split
+    root: Path,
+    num_segmented: NumSegmented,
+    split: Split,
+    supervision: Supervision,
 ) -> list[tuple[int, bool]]:
     fn = root / f"split_weakly_{num_segmented.value}.pyb"
+
+    if split == Split.TEST:
+        file_split = Split.TEST
+    else:
+        file_split = Split.TRAIN
+
     with open(fn, "rb") as f:
         train_samples, test_samples = pickle.load(f)
-        if split == "train":
+        if file_split == "train":
+            train_samples = list(
+                map(
+                    lambda sample: (
+                        sample[0],
+                        segmented2segmented(supervision, sample[1]),
+                    ),
+                    train_samples,
+                )
+            )
             return train_samples
-        elif split == "test":
+        elif file_split == "test":
+            # segmented and labeled always true
+            test_samples = list(map(lambda sample: (sample[0], True), test_samples))
             return test_samples
         else:
-            raise Exception(f"Unknown split {split}")
+            raise Exception(f"Unknown split {file_split}")
 
 
 def is_mask_anomalous(path: str):
@@ -51,23 +72,27 @@ class KSDD2Dataset(SSNDataset):
 
     Args:
         root (Path): path to root of dataset
-        supervised (bool): flag to signal if dataset is in supervised config
+        supervision (Supervision): flag to signal the level of supervision for dataset
         transform (A.Compose): transforms used for preprocessing
         split (Split): either train or test split
         flips (bool): flag if dataset is extended by flipping (vert, horiz, 180).
         num_segmented (NumSegmented): number of segmented images in dataset
+        dilate (int|None) if an int = size of dilation square, if None - not applied (default None)
+        dt (tuple[int, int] | None) distance transform params (w, p), if None - not applied (default None)
         debug (bool): debug flag for some debug printing
     """
 
     def __init__(
         self,
         root: Path,
-        supervised: bool,
+        supervision: Supervision,
         transform: A.Compose,
         split: Split,
         flips: bool,
         normal_flips: bool,
         num_segmented: NumSegmented = NumSegmented.N0,
+        dilate: int | None = None,
+        dt: tuple[int, int] | None = None,
         debug: bool = False,
     ) -> None:
         super().__init__(
@@ -76,14 +101,18 @@ class KSDD2Dataset(SSNDataset):
             split=split,
             flips=flips,
             normal_flips=normal_flips,
-            supervised=supervised,
+            supervision=supervision,
+            dilate=dilate,
+            dt=dt,
             debug=debug,
         )
         self.num_segmented = num_segmented
 
     def make_dataset(self) -> tuple[DataFrame, DataFrame]:
         # read the split with given number of segmented samples
-        split_samples = read_split(self.root, self.num_segmented, self.split)
+        split_samples = read_split(
+            self.root, self.num_segmented, self.split, self.supervision
+        )
 
         # read into form "root, split, sample_id, image_path, mask_path" and only take samples that are segmented.
         # This enables us to have mixed supervised setup, while test remains fully segmented
@@ -94,13 +123,20 @@ class KSDD2Dataset(SSNDataset):
                 self.split.value,
                 str(self.root / self.split.value / f"{sample_id}.png"),
                 str(self.root / self.split.value / f"{sample_id}_GT.png"),
+                is_segmented,
             ]
             for sample_id, is_segmented in split_samples
-            if is_segmented
         ]
         samples = DataFrame(
             samples_list,
-            columns=["path", "sample_id", "split", "image_path", "mask_path"],
+            columns=[
+                "path",
+                "sample_id",
+                "split",
+                "image_path",
+                "mask_path",
+                "is_segmented",
+            ],
         )
         samples["label_index"] = samples["mask_path"].apply(is_mask_anomalous)
         samples.label_index = samples.label_index.astype(int)
@@ -136,6 +172,7 @@ class KSDD2(SSNDataModule):
     def __init__(
         self,
         root: Path | str,
+        supervision: Supervision | None = None,
         image_size: tuple[int, int] | None = None,
         normalization: str
         | InputNormalizationMethod = InputNormalizationMethod.IMAGENET,
@@ -145,16 +182,24 @@ class KSDD2(SSNDataModule):
         seed: int | None = None,
         flips: bool = False,
         normal_flips: bool = False,
-        num_segmented: NumSegmented = NumSegmented.N0,
+        num_segmented: NumSegmented = NumSegmented.N246,
+        dilate: int | None = None,
+        dt: tuple[int, int] | None = None,
         debug: bool = False,
     ) -> None:
-        supervised = num_segmented != NumSegmented.N0
-
+        if supervision is None:
+            if num_segmented == NumSegmented.N0:
+                supervision = Supervision.UNSUPERVISED
+            else:
+                supervision = Supervision.FULLY_SUPERVISED
+            print(
+                f"Dataset supervision parameter is not set, it was automatically set to {supervision}"
+            )
         print(f"Resolution set to: {image_size}")
 
         super().__init__(
             root=root,
-            supervised=supervised,
+            supervision=supervision,
             image_size=image_size,
             normalization=normalization,
             train_batch_size=train_batch_size,
@@ -171,7 +216,9 @@ class KSDD2(SSNDataModule):
             num_segmented=num_segmented,
             flips=flips,
             normal_flips=normal_flips,
-            supervised=supervised,
+            supervision=supervision,
+            dilate=dilate,
+            dt=dt,
             debug=debug,
         )
         self.test_data = KSDD2Dataset(
@@ -181,6 +228,6 @@ class KSDD2(SSNDataModule):
             num_segmented=num_segmented,
             flips=flips,
             normal_flips=False,
-            supervised=supervised,
+            supervision=supervision,
             debug=debug,
         )

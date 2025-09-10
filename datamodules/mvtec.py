@@ -5,7 +5,8 @@ from anomalib.data.mvtec import make_mvtec_dataset
 from anomalib.data.utils import Split, InputNormalizationMethod
 from pandas import DataFrame
 
-from datamodules.base.datamodule import SSNDataModule, BgMask
+from datamodules.base import Supervision
+from datamodules.base.datamodule import SSNDataModule
 from datamodules.base.dataset import SSNDataset
 
 
@@ -36,7 +37,7 @@ class MVTECDataset(SSNDataset):
             split=split,
             flips=False,
             normal_flips=normal_flips,
-            supervised=False,
+            supervision=Supervision.UNSUPERVISED,
             debug=debug,
         )
         self.root_category = Path(root) / Path(category)
@@ -81,7 +82,7 @@ class MVTec(SSNDataModule):
 
         super().__init__(
             root=root,
-            supervised=False,
+            supervision=Supervision.UNSUPERVISED,
             image_size=image_size,
             normalization=normalization,
             train_batch_size=train_batch_size,

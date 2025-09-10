@@ -6,6 +6,7 @@ import albumentations as A
 from anomalib.data.utils import Split, LabelName, InputNormalizationMethod
 from pandas import DataFrame
 
+from datamodules.base import Supervision, segmented2segmented
 from datamodules.base.datamodule import SSNDataModule
 from datamodules.base.dataset import SSNDataset
 
@@ -51,17 +52,50 @@ def read_split(
     category: Category,
     fold: FixedFoldNumber,
     split: Split,
+    supervision: Supervision,
     ratio_segmented: RatioSegmented,
 ) -> tuple[list, list]:
     fn = root / "sensum_splits" / category.value / str(fold.value) / split.value
-    with open(fn / "neg.pckl", "rb") as f:
-        neg_samples = pickle.load(f)
+
     if split == Split.TEST:
-        pos_name = "pos.pckl"
+        with open(fn / "neg.pckl", "rb") as f:
+            neg_samples = pickle.load(f)
+        with open(fn / "pos.pckl", "rb") as f:
+            pos_samples = pickle.load(f)
     else:
-        pos_name = f"pos_{int(ratio_segmented.value * 100)}.pckl"
-    with open(fn / pos_name, "rb") as f:
-        pos_samples = pickle.load(f)
+        if supervision == Supervision.UNSUPERVISED:
+            with open(fn / f"neg.pckl", "rb") as f:
+                neg_samples = pickle.load(f)
+            pos_samples = []
+        else:
+            with open(fn / "neg.pckl", "rb") as f:
+                neg_samples = pickle.load(f)
+            with open(fn / f"pos_{int(ratio_segmented.value * 100)}.pckl", "rb") as f:
+                # currently of shape (sample, is_segmented)
+                pos_samples = pickle.load(f)
+
+    # transform from (sample, is_segmented) to (sample, is_segmented) based on supervision
+    neg_samples = list(
+        map(
+            lambda sample: (
+                sample[0],
+                True,  # neg is always segmented
+            ),
+            neg_samples,
+        )
+    )
+    pos_samples = list(
+        map(
+            lambda sample: (
+                sample[0],
+                split == Split.TEST
+                or segmented2segmented(
+                    supervision, sample[1]
+                ),  # test always seg, otherwise check
+            ),
+            pos_samples,
+        )
+    )
 
     return neg_samples, pos_samples
 
@@ -73,26 +107,30 @@ class SensumDataset(SSNDataset):
     Args:
         root (Path): path to root of dataset
         category (Category): one of the two categories of medicine
-        supervised (bool): flag to signal if dataset is in supervised config
+        supervision (Supervision): flag to signal if dataset is in supervised config
         transform (A.Compose): transforms used for preprocessing
         split (Split): either train or test split
         flips (bool): flag if dataset is extended by flipping (vert, horiz, 180).
         fold (FixedFoldNumber): fold ID of 3-fold cross validation
         ratio_segmented (RatioSegmented): number of segmented images in dataset
         debug (bool): debug flag for some debug printing
+        dilate (int|None) if an int = size of dilation square, if None - not applied (default None)
+        dt (tuple[int, int] | None) distance transform params (w, p), if None - not applied (default None)
     """
 
     def __init__(
         self,
         root: Path,
         category: Category,
-        supervised: bool,
+        supervision: Supervision,
         transform: A.Compose,
         split: Split,
         flips: bool,
         normal_flips: bool,
         fold: FixedFoldNumber,
         ratio_segmented: RatioSegmented,
+        dilate: int | None = None,
+        dt: tuple[int, int] | None = None,
         debug: bool = False,
     ) -> None:
         super().__init__(
@@ -101,7 +139,9 @@ class SensumDataset(SSNDataset):
             split=split,
             flips=flips,
             normal_flips=normal_flips,
-            supervised=supervised,
+            supervision=supervision,
+            dilate=dilate,
+            dt=dt,
             debug=debug,
         )
         self.category = category
@@ -118,9 +158,10 @@ class SensumDataset(SSNDataset):
             fold=self.fold,
             split=self.split,
             ratio_segmented=self.ratio_segmented,
+            supervision=self.supervision,
         )
 
-        # read into form "root, sample_id, split, image_path, mask_path, label_index"
+        # read into form "root, sample_id, split, image_path, mask_path, label_index, is_segmented,"
         normal_samples = [
             [
                 str(self.root),
@@ -134,6 +175,7 @@ class SensumDataset(SSNDataset):
                 ),
                 "",
                 LabelName.NORMAL,
+                True,  # normal always segmented
             ]
             for sample_id, is_segmented in neg
         ]
@@ -146,6 +188,7 @@ class SensumDataset(SSNDataset):
                 "image_path",
                 "mask_path",
                 "label_index",
+                "is_segmented",
             ],
         )
 
@@ -168,9 +211,9 @@ class SensumDataset(SSNDataset):
                     / f"{sample_id:03}.png"
                 ),
                 LabelName.ABNORMAL,
+                is_segmented,
             ]
             for sample_id, is_segmented in pos
-            if is_segmented
         ]
         anomalous_samples = DataFrame(
             anomalous_samples,
@@ -181,6 +224,7 @@ class SensumDataset(SSNDataset):
                 "image_path",
                 "mask_path",
                 "label_index",
+                "is_segmented",
             ],
         )
 
@@ -193,6 +237,7 @@ class Sensum(SSNDataModule):
 
     Args:
         root (Path): path to root of dataset
+        supervision (Supervision): flag to signal the level of supervision for dataset
         image_size ( int | tuple[int, int] | None): image size in format of (h, w)
         fold (FixedFoldNumber): fold ID of 3-fold cross validation
         normalization (str | InputNormalizationMethod): normalization method for images, defaults to imagenet
@@ -202,6 +247,8 @@ class Sensum(SSNDataModule):
         seed (int | None): seed
         flips (bool): flag if dataset is extended by flipping (vert, horiz, 180).
         ratio_segmented (RatioSegmented): number of segmented images in dataset
+        dilate (int|None) if an int = size of dilation square, if None - not applied (default None)
+        dt (tuple[int, int] | None) distance transform params (w, p), if None - not applied (default None)
         debug (bool): debug flag for some debug printing
     """
 
@@ -210,6 +257,7 @@ class Sensum(SSNDataModule):
         root: Path | str,
         category: Category,
         fold: FixedFoldNumber,
+        supervision: Supervision | None = None,
         image_size: tuple[int, int] | None = None,
         normalization: str
         | InputNormalizationMethod = InputNormalizationMethod.IMAGENET,
@@ -220,15 +268,24 @@ class Sensum(SSNDataModule):
         flips: bool = False,
         normal_flips: bool = False,
         ratio_segmented: RatioSegmented = RatioSegmented.M0,
+        dilate: int | None = None,
+        dt: tuple[int, int] | None = None,
         debug: bool = False,
     ) -> None:
-        supervised = ratio_segmented != ratio_segmented.M0
+        if supervision is None:
+            if ratio_segmented == ratio_segmented.M0:
+                supervision = Supervision.UNSUPERVISED
+            else:
+                supervision = Supervision.FULLY_SUPERVISED
+            print(
+                f"Dataset supervision parameter is not set, it was automatically set to {supervision}"
+            )
 
         print(f"Resolution set to: {image_size}")
 
         super().__init__(
             root=root,
-            supervised=supervised,
+            supervision=supervision,
             image_size=image_size,
             normalization=normalization,
             train_batch_size=train_batch_size,
@@ -247,7 +304,9 @@ class Sensum(SSNDataModule):
             ratio_segmented=ratio_segmented,
             flips=flips,
             normal_flips=normal_flips,
-            supervised=supervised,
+            supervision=supervision,
+            dilate=dilate,
+            dt=dt,
             debug=debug,
         )
         self.test_data = SensumDataset(
@@ -259,6 +318,6 @@ class Sensum(SSNDataModule):
             ratio_segmented=ratio_segmented,
             flips=flips,
             normal_flips=False,
-            supervised=supervised,
+            supervision=supervision,
             debug=debug,
         )

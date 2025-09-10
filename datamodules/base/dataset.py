@@ -10,7 +10,7 @@ from scipy.ndimage import distance_transform_edt
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from datamodules.base import BgMask
+from datamodules.base import Supervision
 
 
 class SSNDataset(Dataset):
@@ -19,22 +19,26 @@ class SSNDataset(Dataset):
 
     Args:
         root (Path): path to root of dataset
-        supervised (bool): flag to signal if dataset is in supervised config
+        supervision (Supervision): flag to signal if dataset is in supervised config
         transform (A.Compose): transforms used for preprocessing
         split (Split): either train or test split
         flips (bool): flag if dataset is extended by flipping (vert, horiz, 180).
         normal_flips (bool): flag if we also flip normal data.
+        dilate (int|None) if an int = size of dilation square, if None - not applied (default None)
+        dt (tuple[int, int] | None) distance transform params (w, p), if None - not applied (default None)
         debug (bool): debug flag for some debug printing
     """
 
     def __init__(
         self,
         root: Path,
-        supervised: bool,
+        supervision: Supervision,
         transform: A.Compose,
         split: Split,
         flips: bool,
         normal_flips: bool,
+        dilate: int | None = None,
+        dt: tuple[int, int] | None = None,
         debug: bool = False,
     ) -> None:
         super().__init__()
@@ -42,12 +46,15 @@ class SSNDataset(Dataset):
         self._normal_samples: DataFrame
         self._anomalous_samples: DataFrame
 
-        self.supervised = supervised
+        self.supervision = supervision
 
         self.root = root
         self.split = split
         self.flips = flips
         self.normal_flips = normal_flips
+
+        self.dilate = dilate
+        self.dt = dt
 
         self.counter = 0
         self.generated_num_pos: int = 0
@@ -99,12 +106,14 @@ class SSNDataset(Dataset):
         raise NotImplementedError
 
     def _setup(self) -> None:
+        self.counter = 0
+
         self._normal_samples, self._anomalous_samples = self.make_dataset()
 
         self.num_neg = len(self._normal_samples)
         self.num_pos = len(self._anomalous_samples)
 
-        if self.supervised:
+        if self.supervision != Supervision.UNSUPERVISED:
             # if have positive samples we use frequency sampling
             self.neg_retrieval_freq = np.zeros(shape=self.num_neg)
 
@@ -131,10 +140,13 @@ class SSNDataset(Dataset):
 
     def __len__(self) -> int:
         """Get length of the dataset."""
-        if self.split == Split.TEST:
+        if self.split in [Split.TEST, Split.VAL]:
             # in test, we return true len
             return self.num_pos + self.num_neg
-        elif self.supervised:
+        elif self.supervision == Supervision.UNSUPERVISED:
+            # if we don't have anomalous return num of neg
+            return self.num_neg
+        else:
             # we have positive, return size of balanced data
             if self.flips:
                 # flip v, h, 180 - so we get 4x the pos, balanced with 4times the neg
@@ -142,9 +154,6 @@ class SSNDataset(Dataset):
             else:
                 # if no flipping augmentation
                 return self.num_pos * 2
-        else:
-            # if we don't have anomalous return num of neg
-            return self.num_neg
 
     def generate_permutation(self) -> None:
         """
@@ -167,7 +176,7 @@ class SSNDataset(Dataset):
             replace=self.replace,
         )
 
-    def get_sample_data(self, index) -> tuple[str, str, int]:
+    def get_sample_data(self, index) -> tuple[str, str, int, int]:
         """
         Get image and mask path, label_index (label)
 
@@ -179,21 +188,25 @@ class SSNDataset(Dataset):
         """
         if self.split == Split.TRAIN:
             if index >= self.generated_num_pos:
-                if self.supervised:
+                if self.supervision == Supervision.UNSUPERVISED:
+                    ix = index
+                else:
                     permutation_index = index % self.generated_num_pos
                     ix = self.neg_imgs_permutation[permutation_index]
                     self.neg_retrieval_freq[ix] = self.neg_retrieval_freq[ix] + 1
-                else:
-                    ix = index
                 image_path = self._normal_samples.iloc[ix].image_path
                 mask_path = self._normal_samples.iloc[ix].mask_path
                 label_index = self._normal_samples.iloc[ix].label_index
+                is_segmented = self._normal_samples.iloc[ix].get("is_segmented", True)
             else:
                 # to get actual index of positive
                 ix = index % self.num_pos
                 image_path = self._anomalous_samples.iloc[ix].image_path
                 mask_path = self._anomalous_samples.iloc[ix].mask_path
                 label_index = self._anomalous_samples.iloc[ix].label_index
+                is_segmented = self._anomalous_samples.iloc[ix].get(
+                    "is_segmented", True
+                )
         # test
         else:
             if index < self.num_neg:
@@ -201,13 +214,18 @@ class SSNDataset(Dataset):
                 image_path = self._normal_samples.iloc[ix].image_path
                 mask_path = self._normal_samples.iloc[ix].mask_path
                 label_index = self._normal_samples.iloc[ix].label_index
+                is_segmented = self._normal_samples.iloc[ix].get("is_segmented", True)
+
             else:
                 ix = index - self.num_neg
                 image_path = self._anomalous_samples.iloc[ix].image_path
                 mask_path = self._anomalous_samples.iloc[ix].mask_path
                 label_index = self._anomalous_samples.iloc[ix].label_index
+                is_segmented = self._anomalous_samples.iloc[ix].get(
+                    "is_segmented", True
+                )
 
-        return image_path, mask_path, label_index
+        return image_path, mask_path, label_index, is_segmented
 
     def get_flip_augmentation(self, index) -> A.DualTransform | None | A.Compose:
         """
@@ -247,9 +265,22 @@ class SSNDataset(Dataset):
     def distance_transform(
         self, mask: np.ndarray, max_val: float, p: float
     ) -> np.ndarray:
+        """
+        Apply distance transform to weight the pixels according to distance from center of shape.
+        Distance is additionally transformed using linear function: Omega(d) = w * d^p
+        where w is max_val
+
+        From:
+        https://github.com/vicoslab/mixed-segdec-net-comind2021/blob/
+        21583eb22e719a70fee388ce45f0f7f27f529926/data/dataset.py#L122
+
+        Args:
+            mask (np.ndarray): input segmentation GT mask
+            max_val (float): scalar weight for pos. pixels (w in eq.)
+            p (float): rate of decreasing the pixel importance
+        """
         h, w = mask.shape[:2]
         dst_trf = np.zeros((h, w))
-
         num_labels, labels = cv2.connectedComponents(
             (mask * 255.0).astype(np.uint8), connectivity=8
         )
@@ -278,22 +309,29 @@ class SSNDataset(Dataset):
         """
         if (
             (self.split == Split.TRAIN)
-            and self.supervised
+            and self.supervision != Supervision.UNSUPERVISED
             and (self.counter >= len(self))
         ):
             # we have labeled, so we need freq distr
             self.generate_permutation()
 
-        image_path, mask_path, label_index = self.get_sample_data(index)
+        image_path, mask_path, label_index, is_segmented = self.get_sample_data(index)
 
         image = read_image(image_path)
-        item = dict(image_path=image_path, label=label_index)
+        item = dict(
+            image_path=image_path,
+            label=label_index,
+            is_segmented=is_segmented,
+        )
 
-        if label_index == 0:
-            # normal are all zero
+        if label_index == 0 or not is_segmented:
+            # normal or not segmented are all zero
             mask = np.zeros(shape=image.shape[:2])
         else:
             mask = cv2.imread(mask_path, flags=0) / 255.0
+
+            if self.dilate is not None and self.split == Split.TRAIN:
+                mask = cv2.dilate(mask, np.ones((self.dilate, self.dilate)))
 
         if (self.flips or self.normal_flips) and (self.split == Split.TRAIN):
             # if current image is selected to be flip augmented
@@ -303,7 +341,19 @@ class SSNDataset(Dataset):
                 image = flip_transformed["image"]
                 mask = flip_transformed["mask"]
 
-        transformed = self.transform(image=image, mask=mask)
+        if self.dt is not None:
+            # apply distance transform
+            wp, p = self.dt
+            # if normal all 1, otherwise dist transform
+            if label_index == 0:
+                loss_mask = np.ones(shape=image.shape[:2])
+            else:
+                loss_mask = self.distance_transform(mask, wp, p)
+
+            transformed = self.transform(image=image, mask=mask, loss_mask=loss_mask)
+            item["loss_mask"] = transformed["loss_mask"]
+        else:
+            transformed = self.transform(image=image, mask=mask)
 
         item["image"] = transformed["image"]
         item["mask_path"] = mask_path

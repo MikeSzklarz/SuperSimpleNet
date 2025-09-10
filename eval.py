@@ -114,7 +114,9 @@ def eval(
             am[am != am] = 0
             results["anomaly_map"] = am
 
-            metric.update(results["anomaly_map"], results["gt_mask"].type(torch.float32))
+            metric.update(
+                results["anomaly_map"], results["gt_mask"].type(torch.float32)
+            )
             results_dict[name] = metric.to(device).compute().item()
         except RuntimeError:
             # AUPRO in some cases with early predictions crashes cuda, so just skip it in that case

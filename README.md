@@ -5,7 +5,7 @@ Official implementation of SuperSimpleNet.
 Original: [SuperSimpleNet : Unifying Unsupervised and Supervised Learning for Fast and Reliable Surface Defect Detection](https://arxiv.org/abs/2408.03143) - ICPR 2024.
 
 Extension to mixed supervision: No Label Left Behind: A Unified Surface Defect Detection Model for all Supervision Regimes - JIMS 2025.
-( :warning: Will be available soon - repository is still being refactored for this latest version :warning: ).
+( :warning: Partial support - repository is still being refactored for this latest version :warning: ).
 
 ---
 
