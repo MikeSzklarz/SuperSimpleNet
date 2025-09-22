@@ -10,7 +10,7 @@ from pytorch_lightning import LightningDataModule
 from pytorch_lightning.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADERS
 from torch.utils.data import DataLoader
 
-from datamodules.base import BgMask
+from datamodules.base import Supervision
 from datamodules.base.dataset import SSNDataset
 
 
@@ -20,7 +20,7 @@ class SSNDataModule(LightningDataModule, ABC):
 
     Args:
         root (Path): path to root of dataset
-        supervised (bool): flag to signal if dataset is in supervised config
+        supervision (Supervision): flag to signal if dataset is in supervised config
         image_size ( int | tuple[int, int] | None): image size in format of (h, w)
         normalization (str | InputNormalizationMethod): normalization method for images, defaults to imagenet
         train_batch_size (int): batch size used in training
@@ -28,13 +28,12 @@ class SSNDataModule(LightningDataModule, ABC):
         num_workers (int): number of dataloader workers. Must be <= 1 for supervised
         seed (int | None): seed
         flips (bool): flag if dataset is extended by flipping (vert, horiz, 180)
-        mask_bg (BgMask): flag if we use background masks
     """
 
     def __init__(
         self,
         root: Path | str,
-        supervised: bool,
+        supervision: Supervision,
         image_size: tuple[int, int] | None = None,
         normalization: str
         | InputNormalizationMethod = InputNormalizationMethod.IMAGENET,
@@ -43,7 +42,6 @@ class SSNDataModule(LightningDataModule, ABC):
         num_workers: int = 0,
         seed: int | None = None,
         flips: bool = False,
-        mask_bg: BgMask = BgMask.NONE,
     ) -> None:
         super().__init__()
 
@@ -53,16 +51,17 @@ class SSNDataModule(LightningDataModule, ABC):
         self.num_workers = num_workers
         self.seed = seed
         self.root = Path(root)
-        self.supervised = supervised
+        self.supervision = supervision
 
         self.flips = flips
-        self.mask_bg = mask_bg
 
         self.train_data: SSNDataset
         self.test_data: SSNDataset
 
-        if supervised and (num_workers > 1):
-            raise Exception("Can't use more workers than 1 with positive samples")
+        if supervision != Supervision.UNSUPERVISED and (num_workers > 1):
+            raise Exception(
+                "Can't use more workers than 1 with positive samples due to statistic tracking inside workers"
+            )
 
         base_transforms = [
             A.Resize(height=image_size[0], width=image_size[1], always_apply=True)
@@ -82,14 +81,12 @@ class SSNDataModule(LightningDataModule, ABC):
 
         self.transform_train = A.Compose(
             base_transforms,
-            additional_targets={"bg_mask": "mask"},
-            is_check_shapes=(mask_bg == BgMask.NONE),
+            additional_targets={"loss_mask": "mask"},
         )
 
         self.transform_eval = A.Compose(
             base_transforms,
-            additional_targets={"bg_mask": "mask"},
-            is_check_shapes=(mask_bg == BgMask.NONE),
+            additional_targets={"loss_mask": "mask"},
         )
 
     @property

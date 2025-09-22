@@ -1,6 +1,6 @@
 #!/bin/sh
-#SBATCH --job-name=ssn_icpr
-#SBATCH --output=./sout/ssn_icpr%j.out
+#SBATCH --job-name=ssn
+#SBATCH --output=./sout/ssn%j.out
 #SBATCH --nodes=1
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=12

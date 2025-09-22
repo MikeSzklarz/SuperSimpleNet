@@ -2,10 +2,11 @@
 
 Official implementation of SuperSimpleNet.
 
-Original: [SuperSimpleNet : Unifying Unsupervised and Supervised Learning for Fast and Reliable Surface Defect Detection](https://arxiv.org/abs/2408.03143) - ICPR 2024.
+[![Model on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/model-on-hf-md.svg)](https://huggingface.co/papers/2508.19060)
 
-Extension to mixed supervision: No Label Left Behind: A Unified Surface Defect Detection Model for all Supervision Regimes - JIMS 2025.
-( :warning: Currently available in a separate [jims branch](https://github.com/blaz-r/SuperSimpleNet/tree/jims), but the refactor is not 100% verified :warning: ).
+Original: [SuperSimpleNet : Unifying Unsupervised and Supervised Learning for Fast and Reliable Surface Defect Detection](https://arxiv.org/abs/2408.03143) - ICPR (International Conference on Pattern Recognition) 2024.
+
+Extension to mixed supervision: [No Label Left Behind: A Unified Surface Defect Detection Model for all Supervision Regimes](https://arxiv.org/abs/2508.19060) - JIMS (Journal of Intelligent Manufacturing) 2025.
 
 ---
 
@@ -68,8 +69,8 @@ datasets/
 
 ## Checkpoints
 
-Checkpoints are available [here](https://drive.google.com/file/d/1pCfBxCGXdsN0LVuf4R0KIVE6oRXJwMJ5/view?usp=sharing). 
-Extract them into `./weights` path and ensure they are all inside a directory with run_id 0: 
+Checkpoints are available [here](https://drive.google.com/drive/folders/1bBKL7-xFgNrzOZVnED0jBgqT5poeYf0d). We recommend that you use the latest JIMS weights and JIMS code. 
+Extract checkpoints into `./weights` path and ensure they are all inside a directory with run_id 0: 
 ```
 ./weights/
    0/
@@ -85,7 +86,7 @@ Extract them into `./weights` path and ensure they are all inside a directory wi
 The original ICPR checkpoints don't have the `ratio` subdirectory, 
 while the latest JIMS version also has ratio subdirectory for each mixed supervision scenario.
 
-We report an average of 5 runs in our paper, but the weights from the link are only for the best run.
+We report an average of 5 runs in our paper, but the weights from the link are only for a single run.
 Therefore, the results won't exactly match the ones reported in the paper.
 
 We also include the reported mean and std as a json inside `paper_results` for all datasets in the paper.

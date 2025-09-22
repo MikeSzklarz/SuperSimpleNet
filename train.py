@@ -1,6 +1,8 @@
 import os
 import sys
 
+from datamodules.base import Supervision
+
 LOG_WANDB = False
 
 import copy
@@ -22,7 +24,7 @@ from anomalib.utils.metrics import AUROC, AUPRO
 
 from datamodules import ksdd2, sensum
 from datamodules.ksdd2 import KSDD2, NumSegmented
-from datamodules.sensum import Sensum
+from datamodules.sensum import Sensum, RatioSegmented
 from datamodules.mvtec import MVTec
 from datamodules.visa import Visa
 
@@ -64,44 +66,76 @@ def train(
                 image_batch = batch["image"].to(device)
 
                 # best downsampling proposed by DestSeg
-                mask = batch["mask"].to(device).type(torch.float32)
+                mask = batch["mask"].type(torch.float32).to(device)
                 mask = F.interpolate(
                     mask.unsqueeze(1),
                     size=(model.fh, model.fw),
                     mode="bilinear",
-                    align_corners=False,
+                    align_corners=True,
                 )
                 mask = torch.where(
                     mask < 0.5, torch.zeros_like(mask), torch.ones_like(mask)
                 )
 
                 label = batch["label"].to(device).type(torch.float32)
+                is_segmented = batch["is_segmented"].to(device).type(torch.float32)
 
                 anomaly_map, score, mask, label = model.forward(
                     image_batch, mask, label
                 )
 
+                seg_focal = focal_loss(torch.sigmoid(anomaly_map), mask, reduction=None)
+
+                # use this shape to apply weights from distance transform if enabled
+                seg_l1 = torch.zeros_like(anomaly_map)
+
                 # adjusted truncated l1: mask + flipped sign (ano->pos, good->neg)
                 normal_scores = anomaly_map[mask == 0]
+                seg_l1[mask == 0] = torch.clip(normal_scores + th, min=0)
+
                 anomalous_scores = anomaly_map[mask > 0]
-                true_loss = torch.clip(normal_scores + th, min=0)
-                fake_loss = torch.clip(-anomalous_scores + th, min=0)
+                seg_l1[mask > 0] = torch.clip(-anomalous_scores + th, min=0)
 
-                if len(true_loss):
-                    true_loss = true_loss.mean()
-                else:
-                    true_loss = 0
-                if len(fake_loss):
-                    fake_loss = fake_loss.mean()
-                else:
-                    fake_loss = 0
+                if "loss_mask" in batch:
+                    loss_mask = batch["loss_mask"].type(torch.float32).to(device)
 
-                loss = (
-                    true_loss
-                    + fake_loss
-                    + focal_loss(torch.sigmoid(anomaly_map), mask)
-                    + focal_loss(torch.sigmoid(score), label)
-                )
+                    # resize loss_mask to fit the loss
+                    loss_mask = F.interpolate(
+                        loss_mask.unsqueeze(1),
+                        size=seg_focal.shape[-2:],
+                        mode="bilinear",
+                        align_corners=True,
+                    )
+
+                    # due to feat. duplication stack mask and multiply to get weighted loss
+                    loss_mask = torch.cat((loss_mask, loss_mask))
+                    seg_focal *= loss_mask
+                    seg_l1 *= loss_mask
+
+                # due to feat. duplication
+                is_segmented = torch.cat((is_segmented, is_segmented)).type(torch.bool)
+
+                bad_loss = seg_l1[is_segmented][mask[is_segmented] > 0]
+                good_loss = seg_l1[is_segmented][mask[is_segmented] == 0]
+                focal_val = seg_focal[is_segmented]
+
+                if len(good_loss):
+                    good_loss = good_loss.mean()
+                else:
+                    good_loss = 0
+                if len(bad_loss):
+                    bad_loss = bad_loss.mean()
+                else:
+                    bad_loss = 0
+                if len(focal_val):
+                    focal_val = focal_val.mean()
+                else:
+                    focal_val = 0
+
+                # seg loss is combination of trunc l1 and focal (separately avg each l1 part due to unbalanced pixels)
+                seg_loss = good_loss + bad_loss + focal_val
+
+                loss = seg_loss + focal_loss(torch.sigmoid(score), label)
 
                 loss.backward()
 
@@ -186,7 +220,7 @@ def test(
         anomaly_map = anomaly_map.detach().cpu()
         anomaly_score = anomaly_score.detach().cpu()
 
-        results["anomaly_map"].append(anomaly_map.detach().cpu())
+        results["anomaly_map"].append(torch.sigmoid(anomaly_map).detach().cpu())
         results["gt_mask"].append(batch["mask"].detach().cpu())
 
         results["score"].append(torch.sigmoid(anomaly_score))
@@ -237,7 +271,9 @@ def test(
             am[am != am] = 0
             results["anomaly_map"] = am
 
-            metric.update(results["anomaly_map"], results["gt_mask"].type(torch.float32))
+            metric.update(
+                results["anomaly_map"], results["gt_mask"].type(torch.float32)
+            )
             results_dict[name] = metric.to(device).compute().item()
         except RuntimeError:
             # AUPRO in some cases with early predictions crashes cuda, so just skip it in that case
@@ -320,7 +356,8 @@ def train_and_eval(model, datamodule, config, device):
             / config["setup_name"]
             / "checkpoints"
             / config["dataset"]
-            / config["category"],
+            / config["category"]
+            / str(config["ratio"]),
         )
     except Exception as e:
         print("Error saving checkpoint" + str(e))
@@ -336,12 +373,14 @@ def train_and_eval(model, datamodule, config, device):
         / config["setup_name"]
         / "visual"
         / config["dataset"]
-        / config["category"],
+        / config["category"]
+        / str(config["ratio"]),
         score_save_path=Path(config["results_save_path"])
         / config["setup_name"]
         / "scores"
         / config["dataset"]
-        / config["category"],
+        / config["category"]
+        / str(config["ratio"]),
     )
 
     return results
@@ -350,6 +389,7 @@ def train_and_eval(model, datamodule, config, device):
 def main_mvtec(device, config):
     config = copy.deepcopy(config)
     config["dataset"] = "mvtec"
+    config["ratio"] = 1
 
     categories = [
         "screw",
@@ -414,13 +454,17 @@ def main_mvtec(device, config):
             last=results,
         )
         results_writer.save(
-            Path(config["results_save_path"]) / config["setup_name"] / config["dataset"]
+            Path(config["results_save_path"])
+            / config["setup_name"]
+            / config["dataset"]
+            / str(config["ratio"])
         )
 
 
 def main_visa(device, config):
     config = copy.deepcopy(config)
     config["dataset"] = "visa"
+    config["ratio"] = 1
 
     categories = [
         "candle",
@@ -481,11 +525,14 @@ def main_visa(device, config):
             last=results,
         )
         results_writer.save(
-            Path(config["results_save_path"]) / config["setup_name"] / config["dataset"]
+            Path(config["results_save_path"])
+            / config["setup_name"]
+            / config["dataset"]
+            / str(config["ratio"])
         )
 
 
-def main_ksdd2(device, config):
+def main_ksdd2(device, config, supervision):
     config = copy.deepcopy(config)
     config["dataset"] = "ksdd2"
     config["category"] = "ksdd2"
@@ -500,6 +547,7 @@ def main_ksdd2(device, config):
             "AUPRO",
             "seg-AP-det",
             "seg-I-AUROC",
+            "ratio",
         ]
     )
 
@@ -511,13 +559,16 @@ def main_ksdd2(device, config):
 
     datamodule = KSDD2(
         root=Path(config["datasets_folder"]) / "KolektorSDD2",
+        supervision=supervision,
         image_size=ksdd2.get_default_resolution(),
         train_batch_size=config["batch"],
         eval_batch_size=config["batch"],
         num_workers=config["num_workers"],
-        num_segmented=NumSegmented.N246,
+        num_segmented=NumSegmented(config["ratio"]),
         seed=config["seed"],
         flips=config["flips"],
+        dt=config["dt"],
+        dilate=config["dilate"],
     )
     datamodule.setup()
 
@@ -525,16 +576,20 @@ def main_ksdd2(device, config):
         model=model, datamodule=datamodule, config=config, device=device
     )
 
+    results["ratio"] = config["ratio"]
     results_writer.add_result(
         category="ksdd2",
         last=results,
     )
     results_writer.save(
-        Path(config["results_save_path"]) / config["setup_name"] / config["dataset"]
+        Path(config["results_save_path"])
+        / config["setup_name"]
+        / config["dataset"]
+        / str(config["ratio"])
     )
 
 
-def main_sensum(device, config):
+def main_sensum(device, config, supervision):
     config = copy.deepcopy(config)
     config["dataset"] = "sensum"
 
@@ -547,6 +602,8 @@ def main_sensum(device, config):
             "AUPRO",
             "seg-AP-det",
             "seg-I-AUROC",
+            "fold",
+            "ratio",
         ]
     )
 
@@ -568,15 +625,18 @@ def main_sensum(device, config):
 
             datamodule = Sensum(
                 root=Path(config["datasets_folder"]) / "SensumSODF",
+                supervision=supervision,
                 fold=sensum.FixedFoldNumber(fold_num),
                 category=category,
                 image_size=sensum.get_default_resolution(category),
                 train_batch_size=config["batch"],
                 eval_batch_size=config["batch"],
                 num_workers=config["num_workers"],
-                ratio_segmented=sensum.RatioSegmented.M100,
+                ratio_segmented=sensum.RatioSegmented(config["ratio"]),
                 seed=config["seed"],
                 flips=config["flips"],
+                dt=config["dt"],
+                dilate=config["dilate"],
             )
             datamodule.setup()
 
@@ -584,6 +644,9 @@ def main_sensum(device, config):
                 model=model, datamodule=datamodule, config=config, device=device
             )
 
+            # also log fold as a separate column
+            results["fold"] = fold_num
+            results["ratio"] = config["ratio"]
             results_writer.add_result(
                 category=f"{category.value}",
                 last=results,
@@ -592,6 +655,7 @@ def main_sensum(device, config):
                 Path(config["results_save_path"])
                 / config["setup_name"]
                 / config["dataset"]
+                / str(config["ratio"])
             )
 
 
@@ -599,7 +663,7 @@ def run_unsup(data_name):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     config = {
-        "wandb_project": "icpr",
+        "wandb_project": "ssn",
         "datasets_folder": Path("./datasets"),
         "num_workers": 8,
         "setup_name": "superSimpleNet",
@@ -611,6 +675,7 @@ def run_unsup(data_name):
         "no_anomaly": "empty",
         "bad": True,
         "overlap": True,  # makes no difference, just faster if false to avoid computation
+        "adapt_cls_feat": False,  # (JIMS extension) cls features are not adapted
         "noise_std": 0.015,
         # "perlin_thr": x,
         "image_size": (256, 256),
@@ -638,10 +703,12 @@ def run_unsup(data_name):
 def run_sup(data_name):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     config = {
-        "wandb_project": "icpr",
+        "wandb_project": "ssn",
         "datasets_folder": Path("./datasets"),
         "num_workers": 1,
         "setup_name": "superSimpleNet",
+        "dt": (3, 2),   # distance transform
+        "dilate": 7,    # dilate mask
         "backbone": "wide_resnet50_2",
         "layers": ["layer2", "layer3"],
         "patch_size": 3,
@@ -650,6 +717,7 @@ def run_sup(data_name):
         "no_anomaly": "empty",
         "bad": True,
         "overlap": False,
+        "adapt_cls_feat": False,  # (JIMS extension) cls features are not adapted
         "noise_std": 0.015,
         "perlin_thr": 0.6,
         "seed": 456654,
@@ -666,9 +734,21 @@ def run_sup(data_name):
         "results_save_path": Path("./results"),
     }
     if data_name == "sensum":
-        main_sensum(device=device, config=config)
+        config["ratio"] = RatioSegmented.M100.value
+
+        if float(config["ratio"]) == 0:
+            config["perlin_thr"] = 0.2
+        main_sensum(
+            device=device, config=config, supervision=Supervision.MIXED_SUPERVISION
+        )
     if data_name == "ksdd2":
-        main_ksdd2(device=device, config=config)
+        config["ratio"] = NumSegmented.N246.value
+
+        if float(config["ratio"]) == 0:
+            config["perlin_thr"] = 0.2
+        main_ksdd2(
+            device=device, config=config, supervision=Supervision.MIXED_SUPERVISION
+        )
 
 
 def main():
