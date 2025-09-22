@@ -371,8 +371,8 @@ def run_eval(datasets, ratios, run_id, res_path):
         res_path: path to where  results csv will be saved
     """
     config = {
-        "weights_path": Path(r"./jim_weights"),
-        "datasets_folder": Path(r"D:\anomaly"),
+        "weights_path": Path(r"./weights"),
+        "datasets_folder": Path(r"./datasets"),
         "results_save_path": res_path,
         "image_save_path": None,  # set to save images
         "score_save_path": None,  # set to save scores

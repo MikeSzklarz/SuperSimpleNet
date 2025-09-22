@@ -663,7 +663,7 @@ def run_unsup(data_name):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     config = {
-        "wandb_project": "icpr",
+        "wandb_project": "ssn",
         "datasets_folder": Path("./datasets"),
         "num_workers": 8,
         "setup_name": "superSimpleNet",
@@ -703,12 +703,12 @@ def run_unsup(data_name):
 def run_sup(data_name):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     config = {
-        "wandb_project": "icpr",
+        "wandb_project": "ssn",
         "datasets_folder": Path("./datasets"),
         "num_workers": 1,
         "setup_name": "superSimpleNet",
-        "dt": (3, 2),
-        "dilate": 7,
+        "dt": (3, 2),   # distance transform
+        "dilate": 7,    # dilate mask
         "backbone": "wide_resnet50_2",
         "layers": ["layer2", "layer3"],
         "patch_size": 3,
