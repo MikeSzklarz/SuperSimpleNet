@@ -69,7 +69,7 @@ datasets/
 
 ## Checkpoints
 
-Checkpoints are available [here](https://drive.google.com/file/d/1pCfBxCGXdsN0LVuf4R0KIVE6oRXJwMJ5/view?usp=sharing). We recommend that you use the latest JIMS weights and JIMS code. 
+Checkpoints are available [here](https://drive.google.com/drive/folders/1bBKL7-xFgNrzOZVnED0jBgqT5poeYf0d). We recommend that you use the latest JIMS weights and JIMS code. 
 Extract checkpoints into `./weights` path and ensure they are all inside a directory with run_id 0: 
 ```
 ./weights/
