@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from pytorch_lightning import LightningDataModule, seed_everything
 
-from torchmetrics import AveragePrecision, Metric
+from torchmetrics import AveragePrecision, Metric, F1Score
 from anomalib.utils.metrics import AUROC, AUPRO
 
 from datamodules import ksdd2, sensum
@@ -27,6 +27,7 @@ from datamodules.ksdd2 import KSDD2, NumSegmented
 from datamodules.sensum import Sensum, RatioSegmented
 from datamodules.mvtec import MVTec
 from datamodules.visa import Visa
+from datamodules.custom_loader import CustomMixed
 
 from model.supersimplenet import SuperSimpleNet
 
@@ -51,9 +52,15 @@ def train(
 
     model.train()
     train_loader = datamodule.train_dataloader()
+    
+    results = {}
+    
     for epoch in range(epochs):
         model.train()
         total_loss = 0
+        
+        output = {}
+        
         with tqdm(
             total=len(train_loader),
             desc=str(epoch) + "/" + str(epochs),
@@ -330,6 +337,7 @@ def train_and_eval(model, datamodule, config, device):
     image_metrics = {
         "I-AUROC": AUROC(),
         "AP-det": AveragePrecision(num_classes=1),
+        "F1": F1Score(task="binary", threshold=0.5),
     }
     pixel_metrics = {
         "P-AUROC": AUROC(),
@@ -658,13 +666,57 @@ def main_sensum(device, config, supervision):
                 / str(config["ratio"])
             )
 
+def main_custom(device, config, supervision):
+    config = copy.deepcopy(config)
+    dataset_name = config.get("dataset", "custom_mixed")
+    config["dataset"] = dataset_name
+    config["category"] = dataset_name 
+    config["name"] = f"{dataset_name}_{config['setup_name']}"
+
+    results_writer = ResultsWriter(
+        metrics=["AP-det", "AP-loc", "P-AUROC", "I-AUROC", "AUPRO", "F1", "seg-AP-det", "seg-I-AUROC"]
+    )
+
+    print(f"Training on {dataset_name} (path: {config['datasets_folder']}) with {supervision}")
+
+    seed_everything(config["seed"], workers=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    model = SuperSimpleNet(image_size=config["image_size"], config=config)
+
+    # --- UPDATED INITIALIZATION ---
+    datamodule = CustomMixed(
+        root=Path(config["datasets_folder"]),
+        supervision=supervision,
+        image_size=config["image_size"],
+        train_batch_size=config["batch"],
+        eval_batch_size=config["batch"],
+        num_workers=config["num_workers"],
+        seed=config["seed"],
+        flips=config["flips"],
+        dt=config["dt"],
+        dilate=config["dilate"],
+        test_split_ratio=config.get("test_split_ratio", 0.2), # Pass the ratio here
+    )
+    # ------------------------------
+    datamodule.setup()
+
+    results = train_and_eval(
+        model=model, datamodule=datamodule, config=config, device=device
+    )
+
+    results_writer.add_result(category=dataset_name, last=results)
+    results_writer.save(
+        Path(config["results_save_path"]) / config["setup_name"] / config["dataset"] / "mixed"
+    )
 
 def run_unsup(data_name):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     config = {
         "wandb_project": "ssn",
-        "datasets_folder": Path("./datasets"),
+        "datasets_folder": Path("../data"),
         "num_workers": 8,
         "setup_name": "superSimpleNet",
         "backbone": "wide_resnet50_2",
@@ -702,9 +754,10 @@ def run_unsup(data_name):
 
 def run_sup(data_name):
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    base_data_path = Path("../data/BowTie-New")
     config = {
         "wandb_project": "ssn",
-        "datasets_folder": Path("./datasets"),
+        "datasets_folder": Path("./datasets"), 
         "num_workers": 1,
         "setup_name": "superSimpleNet",
         "dt": (3, 2),   # distance transform
@@ -721,6 +774,7 @@ def run_sup(data_name):
         "noise_std": 0.015,
         "perlin_thr": 0.6,
         "seed": 456654,
+        "image_size": (256, 256),
         "batch": 32,
         "epochs": 300,
         "flips": True,
@@ -732,10 +786,24 @@ def run_sup(data_name):
         "clip_grad": True,
         "eval_step_size": 4,
         "results_save_path": Path("./results"),
+        "test_split_ratio": 0.2,
     }
+    
+    target_folder = base_data_path / data_name
+    
+    known_custom_sets = ["color_profile_1_2_3_cleaned", "color_profile_1_cleaned", "color_profile_2_cleaned", "color_profile_3_cleaned"]
+
+    if target_folder.exists() and (data_name in known_custom_sets or "cleaned" in data_name):
+        config["datasets_folder"] = target_folder
+        config["dataset"] = data_name
+        config["ratio"] = "mixed" 
+        main_custom(
+            device=device, config=config, supervision=Supervision.MIXED_SUPERVISION
+        )
+        return
+
     if data_name == "sensum":
         config["ratio"] = RatioSegmented.M100.value
-
         if float(config["ratio"]) == 0:
             config["perlin_thr"] = 0.2
         main_sensum(
@@ -743,7 +811,6 @@ def run_sup(data_name):
         )
     if data_name == "ksdd2":
         config["ratio"] = NumSegmented.N246.value
-
         if float(config["ratio"]) == 0:
             config["perlin_thr"] = 0.2
         main_ksdd2(
