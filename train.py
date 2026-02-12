@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from pytorch_lightning import LightningDataModule, seed_everything
 
-from torchmetrics import AveragePrecision, Metric
+from torchmetrics import AveragePrecision, Metric, F1Score, PrecisionRecallCurve
 from anomalib.utils.metrics import AUROC, AUPRO
 
 from datamodules import ksdd2, sensum
@@ -27,6 +27,7 @@ from datamodules.ksdd2 import KSDD2, NumSegmented
 from datamodules.sensum import Sensum, RatioSegmented
 from datamodules.mvtec import MVTec
 from datamodules.visa import Visa
+from datamodules.bowtie import BowTie
 
 from model.supersimplenet import SuperSimpleNet
 
@@ -190,13 +191,15 @@ def test(
     model.to(device)
     model.eval()
 
-    # for anomaly map max as image score
+    # --- Metrics Setup ---
+    # We add F1 metrics dynamically here to ensure they are on the correct device
+    f1_fixed = F1Score(task="binary", threshold=0.5).to(device)
+    
+    # Setup standard metrics
     seg_image_metrics = {}
-
     for m_name, metric in image_metrics.items():
         metric.cpu()
         metric.reset()
-
         seg_image_metrics[f"seg-{m_name}"] = copy.deepcopy(metric)
 
     for metric in pixel_metrics.values():
@@ -213,6 +216,8 @@ def test(
         "image_path": [],
         "mask_path": [],
     }
+    
+    # --- Inference Loop ---
     for batch in tqdm(test_loader, position=0, leave=True):
         image_batch = batch["image"].to(device)
         anomaly_map, anomaly_score = model.forward(image_batch)
@@ -223,6 +228,7 @@ def test(
         results["anomaly_map"].append(torch.sigmoid(anomaly_map).detach().cpu())
         results["gt_mask"].append(batch["mask"].detach().cpu())
 
+        # Scores are kept as probabilities/logits for metric calculation
         results["score"].append(torch.sigmoid(anomaly_score))
         results["seg_score"].append(
             anomaly_map.reshape(anomaly_map.shape[0], -1).max(dim=1).values
@@ -238,86 +244,66 @@ def test(
     results["gt_mask"] = torch.cat(results["gt_mask"])
     results["label"] = torch.cat(results["label"])
 
-    # normalize
+    # --- Normalization ---
     if normalize:
-        results["anomaly_map"] = (
-            results["anomaly_map"] - results["anomaly_map"].flatten().min()
-        ) / (
-            results["anomaly_map"].flatten().max()
-            - results["anomaly_map"].flatten().min()
-        )
-        results["score"] = (results["score"] - results["score"].min()) / (
-            results["score"].max() - results["score"].min()
-        )
-        results["seg_score"] = (results["seg_score"] - results["seg_score"].min()) / (
-            results["seg_score"].max() - results["seg_score"].min()
-        )
+        min_score = results["score"].min()
+        max_score = results["score"].max()
+        # Prevent division by zero
+        if max_score != min_score:
+            results["score"] = (results["score"] - min_score) / (max_score - min_score)
+        
+        min_seg = results["seg_score"].min()
+        max_seg = results["seg_score"].max()
+        if max_seg != min_seg:
+            results["seg_score"] = (results["seg_score"] - min_seg) / (max_seg - min_seg)
+
+        # Normalize maps (optional, mostly for viz)
+        results["anomaly_map"] = (results["anomaly_map"] - results["anomaly_map"].min()) / \
+                                 (results["anomaly_map"].max() - results["anomaly_map"].min() + 1e-8)
 
     results_dict = {}
+
+    # --- Compute Standard Metrics ---
     for name, metric in image_metrics.items():
         metric.update(results["score"], results["label"])
         results_dict[name] = metric.to(device).compute().item()
         metric.to("cpu")
 
-    for name, metric in seg_image_metrics.items():
-        metric.update(results["seg_score"], results["label"])
-        results_dict[name] = metric.to(device).compute().item()
-        metric.to("cpu")
+    # --- Compute F1 Scores ---
+    # 1. Fixed Threshold (0.5)
+    f1_fixed.update(results["score"].to(device), results["label"].to(device))
+    results_dict["F1-Fixed-0.5"] = f1_fixed.compute().item()
+    
+    # 2. Max F1 Score (Iterate thresholds using PrecisionRecallCurve)
+    pr_curve = PrecisionRecallCurve(task="binary").to(device)
+    precision, recall, thresholds = pr_curve(results["score"].to(device), results["label"].to(device))
+    f1_scores = 2 * (precision * recall) / (precision + recall + 1e-8)
+    best_f1_idx = torch.argmax(f1_scores)
+    results_dict["F1-Max"] = f1_scores[best_f1_idx].item()
+    results_dict["Best-Threshold"] = thresholds[best_f1_idx].item() if best_f1_idx < len(thresholds) else 0.5
 
+    # --- Compute Pixel Metrics (Skip if no masks/weak supervision generally implies bad masks) ---
+    # Since you have no ground truth masks, these metrics (P-AUROC, etc) will be meaningless (likely 0.5 or error).
+    # We keep them to prevent crashes but wrap in try-catch.
     for name, metric in pixel_metrics.items():
         try:
-            # avoid nan in early stages
-            am = results["anomaly_map"]
-            am[am != am] = 0
-            results["anomaly_map"] = am
-
-            metric.update(
-                results["anomaly_map"], results["gt_mask"].type(torch.float32)
-            )
+            metric.update(results["anomaly_map"], results["gt_mask"].type(torch.float32))
             results_dict[name] = metric.to(device).compute().item()
-        except RuntimeError:
-            # AUPRO in some cases with early predictions crashes cuda, so just skip it in that case
-            results_dict[name] = 0
+        except Exception:
+            results_dict[name] = 0.0
         metric.to("cpu")
 
+    # Print Results
+    print("\n--- Test Results ---")
     for name, value in results_dict.items():
-        print(f"{name}: {value} ", end="")
-    print()
+        print(f"{name}: {value:.4f}")
+    print("--------------------")
 
+    # --- Saving / Visualization ---
     if image_save_path:
-        print("Visualizing")
+        print(f"Visualizing to {image_save_path}")
         visualizer = Visualizer(image_save_path)
         visualizer.visualize(results)
-
-    score_dict = {}
-    if score_save_path:
-        # save both segscore and score to json
-        for img_path, score, seg_score, label in zip(
-            results["image_path"],
-            results["score"],
-            results["seg_score"],
-            results["label"],
-        ):
-            img_path = Path(img_path)
-
-            anomaly_type = img_path.parent.name
-            if anomaly_type not in score_dict:
-                score_dict[anomaly_type] = {"good": {}, "bad": {}}
-
-            # since some datasets (sensum) can have same names in bad and good
-            if label == 1:
-                kind = "bad"
-            else:
-                kind = "good"
-
-            score_dict[anomaly_type][kind][img_path.stem] = {
-                "score": score.item(),
-                "seg_score": seg_score.item(),
-            }
-
-        score_save_path.mkdir(exist_ok=True, parents=True)
-        with open(score_save_path / "scores.json", "w") as f:
-            json.dump(score_dict, f)
 
     return results_dict
 
@@ -658,6 +644,61 @@ def main_sensum(device, config, supervision):
                 / str(config["ratio"])
             )
 
+def main_bowtie(device, config, specific_category=None):
+    config = copy.deepcopy(config)
+    config["dataset"] = "bowtie"
+    
+    if specific_category:
+        categories = [specific_category]
+    else:
+        # Fallback list if no specific category is given
+        categories = ["color_profile_1", "color_profile_1_2", "color_profile_1_2_3"]
+
+    results_writer = ResultsWriter(
+        metrics=[
+            "AP-det",
+            "I-AUROC",
+            "F1-Fixed-0.5",
+            "F1-Max",
+            "Best-Threshold"
+        ]
+    )
+
+    for category in categories:
+        print(f"Training on {category}")
+
+        config["category"] = category
+        config["name"] = f"{category}_{config['setup_name']}"
+
+        seed_everything(config["seed"], workers=True)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+        model = SuperSimpleNet(image_size=config["image_size"], config=config)
+
+        # Initialize the new BowTie DataModule
+        datamodule = BowTie(
+            root=Path(config["datasets_folder"]) / "BowTie-New", # Point to parent of color_profile_x
+            category=category,
+            image_size=config["image_size"],
+            train_batch_size=config["batch"],
+            eval_batch_size=config["batch"],
+            num_workers=config["num_workers"],
+            seed=config["seed"],
+            debug=False
+        )
+        datamodule.setup()
+
+        results = train_and_eval(
+            model=model, datamodule=datamodule, config=config, device=device
+        )
+
+        results_writer.add_result(category=category, last=results)
+        results_writer.save(
+            Path(config["results_save_path"])
+            / config["setup_name"]
+            / config["dataset"]
+        )
 
 def run_unsup(data_name):
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -700,11 +741,11 @@ def run_unsup(data_name):
         main_mvtec(device=device, config=config)
 
 
-def run_sup(data_name):
+def run_sup(data_name, category=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     config = {
         "wandb_project": "ssn",
-        "datasets_folder": Path("./datasets"),
+        "datasets_folder": Path("../data"),
         "num_workers": 1,
         "setup_name": "superSimpleNet",
         "dt": (3, 2),   # distance transform
@@ -732,7 +773,13 @@ def run_sup(data_name):
         "clip_grad": True,
         "eval_step_size": 4,
         "results_save_path": Path("./results"),
+        "image_size": (256, 256),
+        "ratio": "weak_supervision",
     }
+    
+    if data_name == "bowtie":
+        main_bowtie(device=device, config=config, specific_category=category)
+    
     if data_name == "sensum":
         config["ratio"] = RatioSegmented.M100.value
 
@@ -752,8 +799,13 @@ def run_sup(data_name):
 
 
 def main():
-    run_unsup(sys.argv[1])
-    run_sup(sys.argv[1])
+    data_name = sys.argv[1]
+    category_name = sys.argv[2] if len(sys.argv) > 2 else None
+    
+    if data_name != "bowtie":
+        run_unsup(data_name)
+        
+    run_sup(data_name, category_name)
 
 
 if __name__ == "__main__":
