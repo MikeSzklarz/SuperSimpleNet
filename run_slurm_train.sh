@@ -32,13 +32,11 @@ sbatch "$@" <<EOT
 #SBATCH --job-name="$JOB_NAME"
 #SBATCH --output="${LOG_DIR}/${JOB_NAME}_%j.out"
 #SBATCH --error="${LOG_DIR}/${JOB_NAME}_%j.err"
-#SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --gres=gpu:1           
-#SBATCH --mem=32G              
+#SBATCH --cpus-per-task=8         
+#SBATCH --mem=0              
 #SBATCH --time=24:00:00
-#SBATCH --partition=waccamaw   # Default partition (can be overridden by flag)
+#SBATCH --exclusive
 
 set -e
 
