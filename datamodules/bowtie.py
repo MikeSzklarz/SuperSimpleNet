@@ -92,7 +92,7 @@ class BowTieDataset(SSNDataset):
                 "image_path": [str(p) for p in files_normal],
                 "label_index": 0,
                 "mask_path": "",  # No masks
-                "is_segmented": False 
+                "is_segmented": True 
             })
 
         # Create Anomalous DataFrame

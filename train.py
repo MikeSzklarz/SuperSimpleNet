@@ -763,7 +763,7 @@ def run_sup(data_name, category=None):
         "perlin_thr": 0.6,
         "seed": 456654,
         "batch": 32,
-        "epochs": 300,
+        "epochs": 500,
         "flips": True,
         "seg_lr": 0.0002,
         "dec_lr": 0.0002,
