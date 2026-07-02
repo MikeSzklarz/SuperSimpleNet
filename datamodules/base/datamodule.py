@@ -1,3 +1,5 @@
+import logging
+import math
 from abc import ABC
 from enum import Enum
 from pathlib import Path
@@ -12,6 +14,8 @@ from torch.utils.data import DataLoader
 
 from datamodules.base import Supervision
 from datamodules.base.dataset import SSNDataset
+
+_log = logging.getLogger("ssn")
 
 
 class SSNDataModule(LightningDataModule, ABC):
@@ -128,6 +132,32 @@ class SSNDataModule(LightningDataModule, ABC):
 
         self.train_data.setup()
         self.test_data.setup()
+
+        train_len = len(self.train_data)
+        test_len = len(self.test_data)
+        n_train_batches = math.ceil(train_len / self.train_batch_size)
+        n_test_batches = math.ceil(test_len / self.eval_batch_size)
+
+        _log.info("─── DataModule Setup ────────────────────────────────────────")
+        _log.info("  Supervision mode:  %s", self.supervision.value)
+        _log.info("  Image size:        %s", self.image_size)
+        _log.info("")
+        _log.info("  Training dataloader:")
+        _log.info("    Samples:         %4d", train_len)
+        _log.info("    Batch size:      %4d", self.train_batch_size)
+        _log.info("    Batches/epoch:   %4d", n_train_batches)
+        _log.info("    Workers:         %4d", self.num_workers)
+        _log.info("")
+        _log.info("  Test dataloader:")
+        _log.info(
+            "    Samples:         %4d  (%d normal / %d anomalous)",
+            test_len,
+            self.test_data.num_neg,
+            self.test_data.num_pos,
+        )
+        _log.info("    Batch size:      %4d", self.eval_batch_size)
+        _log.info("    Batches/eval:    %4d", n_test_batches)
+        _log.info("─────────────────────────────────────────────────────────────")
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
         """Get train dataloader."""

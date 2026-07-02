@@ -1,13 +1,14 @@
+import argparse
+import copy
+import json
+import logging
 import os
 import sys
+from pathlib import Path
 
 from datamodules.base import Supervision
 
 LOG_WANDB = False
-
-import copy
-import json
-from pathlib import Path
 
 if LOG_WANDB:
     import wandb
@@ -27,13 +28,307 @@ from datamodules.ksdd2 import KSDD2, NumSegmented
 from datamodules.sensum import Sensum, RatioSegmented
 from datamodules.mvtec import MVTec
 from datamodules.visa import Visa
+from datamodules.custom import Custom
 
 from model.supersimplenet import SuperSimpleNet
 
 from common.visualizer import Visualizer
 from common.results_writer import ResultsWriter
 from common.loss import focal_loss
+from common.logger import setup_logger, add_file_handler, get_logger
+from common.metrics import MaxF1Score
+from common.experiment import ExperimentDir
 
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def _load_config_files(argv: list[str]) -> list[str]:
+    """Expand --config <path> flags before argparse sees them.
+
+    Each config file is one argument per line (blank lines and # comments ignored).
+    Multiple --config flags are allowed and merged in order; CLI args added after
+    --config override values from the file.
+    """
+    result = []
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("--config", "-c"):
+            i += 1
+            if i >= len(argv):
+                print("ERROR: --config requires a path argument", file=sys.stderr)
+                sys.exit(1)
+            config_path = Path(argv[i])
+            if not config_path.exists():
+                print(
+                    f"ERROR: config file not found: {config_path}\n"
+                    f"  Looked in: {config_path.resolve()}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            with open(config_path) as f:
+                lines = [
+                    line.strip()
+                    for line in f
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+            result.extend(lines)
+        else:
+            result.append(argv[i])
+        i += 1
+    return result
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse CLI arguments.
+
+    Config files can be loaded with --config path/to/file.txt (one arg per line).
+    Multiple --config flags are supported and merged in order. The legacy
+    @path/to/file.txt syntax also still works.
+    """
+    parser = argparse.ArgumentParser(
+        description="SuperSimpleNet — train and evaluate anomaly detection",
+        fromfile_prefix_chars="@",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=(
+            "Config files: use  --config configs/custom_fully_sup.txt  to load arguments "
+            "from a file (one argument per line, # comments supported). "
+            "CLI arguments after --config override values from the file."
+        ),
+    )
+
+    # ---- dataset / paths ----
+    ds = parser.add_argument_group("Dataset")
+    ds.add_argument(
+        "--dataset",
+        required=True,
+        choices=["mvtec", "visa", "ksdd2", "sensum", "custom"],
+        help="Which dataset to train on",
+    )
+    ds.add_argument(
+        "--mode",
+        default="unsup",
+        choices=["unsup", "sup"],
+        help="Supervision mode (unsup = unsupervised, sup = mixed/full supervision)",
+    )
+    ds.add_argument(
+        "--datasets-folder",
+        type=Path,
+        default=Path("./datasets"),
+        help="Root folder that contains all dataset sub-directories",
+    )
+    ds.add_argument(
+        "--data-root",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to the custom dataset root directory (required when --dataset custom). "
+            "Pass this on the command line rather than in a config file so it stays "
+            "machine-specific. The directory must exist and contain train/ and test/ subfolders."
+        ),
+    )
+    ds.add_argument(
+        "--good-test-split",
+        type=float,
+        default=0.2,
+        metavar="FRAC",
+        help="Fraction of train/good images withheld for test when no test/good folder exists",
+    )
+    ds.add_argument(
+        "--defect-train-split",
+        type=float,
+        default=0.0,
+        metavar="FRAC",
+        help=(
+            "Fraction of test/<defect>/ images automatically used for supervised training. "
+            "Required for weakly/mixed/fully supervision (e.g. 0.5). "
+            "The remaining fraction is always reserved for test evaluation. "
+            "No manual file organisation needed."
+        ),
+    )
+    ds.add_argument(
+        "--category",
+        default=None,
+        help="Override category name (custom dataset only; defaults to folder name)",
+    )
+    ds.add_argument(
+        "--supervision",
+        choices=["unsupervised", "weakly", "mixed", "fully"],
+        default=None,
+        help=(
+            "Supervision level for custom dataset training. "
+            "unsupervised = normal samples only; "
+            "weakly = anomalous training samples, masks used when available; "
+            "mixed = same as weakly; "
+            "fully = all anomalous training samples must have masks. "
+            "Default: unsupervised when --mode unsup, mixed when --mode sup."
+        ),
+    )
+
+    # ---- output / book-keeping ----
+    out = parser.add_argument_group("Output")
+    out.add_argument(
+        "--results-dir",
+        type=Path,
+        default=Path("./results"),
+        metavar="PATH",
+        help="Root directory where all experiment outputs are written (default: ./results)",
+    )
+    out.add_argument(
+        "--run-name",
+        default=None,
+        help=(
+            "Name for this experiment's output subfolder under results-save-path "
+            "(e.g. 'custom-fully-supervised'). Set this in your config file to give "
+            "each experiment a meaningful, stable name. If omitted, a short name is "
+            "generated from dataset and category."
+        ),
+    )
+    out.add_argument(
+        "--setup-name",
+        default="superSimpleNet",
+        help="Legacy sub-directory name (unused when --run-name is set)",
+    )
+    out.add_argument("--wandb-project", default="ssn", help="Weights & Biases project name")
+
+    # ---- model architecture ----
+    arch = parser.add_argument_group("Architecture")
+    arch.add_argument("--backbone", default="wide_resnet50_2", help="Torchvision backbone name")
+    arch.add_argument(
+        "--layers",
+        nargs="+",
+        default=["layer2", "layer3"],
+        metavar="LAYER",
+        help="Backbone layers to extract features from",
+    )
+    arch.add_argument("--patch-size", type=int, default=3, help="Avg-pool kernel for neighbourhood aggregation")
+
+    # ---- training schedule ----
+    tr = parser.add_argument_group("Training")
+    tr.add_argument("--epochs", type=int, default=300)
+    tr.add_argument("--batch", type=int, default=32, help="Batch size for training and evaluation")
+    tr.add_argument("--seed", type=int, default=42)
+    tr.add_argument("--num-workers", type=int, default=8, help="DataLoader workers")
+    tr.add_argument("--eval-step-size", type=int, default=4, help="Run evaluation every N epochs")
+    tr.add_argument("--image-size", type=int, nargs=2, default=[256, 256], metavar=("H", "W"))
+
+    # ---- optimiser ----
+    opt = parser.add_argument_group("Optimiser")
+    opt.add_argument("--seg-lr", type=float, default=0.0002)
+    opt.add_argument("--dec-lr", type=float, default=0.0002)
+    opt.add_argument("--adapt-lr", type=float, default=0.0001)
+    opt.add_argument("--gamma", type=float, default=0.4, help="LR scheduler decay factor")
+
+    # ---- anomaly generation ----
+    ano = parser.add_argument_group("Anomaly generation")
+    ano.add_argument("--noise-std", type=float, default=0.015, help="Std dev of Gaussian feature noise")
+    ano.add_argument(
+        "--perlin-thr",
+        type=float,
+        default=None,
+        metavar="THR",
+        help="Perlin noise binarisation threshold (dataset-specific default applied if omitted)",
+    )
+    ano.add_argument(
+        "--no-anomaly",
+        default="empty",
+        choices=["empty", "full", "none"],
+        help="What to do when 50%% chance selects 'no anomaly': empty=zero mask, full=full mask, none=keep",
+    )
+    ano.add_argument("--noise", default=True, action=argparse.BooleanOptionalAction)
+    ano.add_argument("--perlin", default=True, action=argparse.BooleanOptionalAction)
+    ano.add_argument("--bad", default=True, action=argparse.BooleanOptionalAction,
+                     help="Apply noise to already-anomalous samples")
+    ano.add_argument("--overlap", default=False, action=argparse.BooleanOptionalAction,
+                     help="Allow synthetic noise to overlap existing anomalous regions")
+
+    # ---- training flags ----
+    fl = parser.add_argument_group("Training flags")
+    fl.add_argument("--clip-grad", default=None, action=argparse.BooleanOptionalAction,
+                    help="Clip gradients to norm=1 (default: False for unsup, True for sup)")
+    fl.add_argument("--stop-grad", default=None, action=argparse.BooleanOptionalAction,
+                    help="Stop gradient from anomaly map into decoder head (default: True for unsup, False for sup)")
+    fl.add_argument("--adapt-cls-feat", default=False, action=argparse.BooleanOptionalAction,
+                    help="Use adapted features for classification head (ICPR extension)")
+    fl.add_argument("--flips", default=None, action=argparse.BooleanOptionalAction,
+                    help="Augment anomalous training samples with flips (default: False for unsup, True for sup)")
+    fl.add_argument("--amp", action="store_true", default=False,
+                    help="Enable automatic mixed precision (fp16) training — CUDA only")
+
+    # ---- supervised-only ----
+    sup = parser.add_argument_group("Supervised options (ksdd2 / sensum only)")
+    sup.add_argument("--dt", type=int, nargs=2, default=None, metavar=("WEIGHT", "POWER"),
+                     help="Distance transform params (default: 3 2 for sup mode)")
+    sup.add_argument("--dilate", type=int, default=None,
+                     help="Mask dilation kernel size (default: 7 for sup mode)")
+    sup.add_argument("--ratio", type=float, default=None,
+                     help="Fraction/count of segmented samples for sup datasets")
+
+    return parser.parse_args(_load_config_files(sys.argv[1:]))
+
+
+def _build_config(args: argparse.Namespace) -> dict:
+    """Convert parsed args into the config dict used by the rest of the code."""
+    is_sup = args.mode == "sup"
+
+    # mode-specific defaults for flags not explicitly set
+    clip_grad = args.clip_grad if args.clip_grad is not None else is_sup
+    stop_grad = args.stop_grad if args.stop_grad is not None else (not is_sup)
+    flips = args.flips if args.flips is not None else is_sup
+    dt = tuple(args.dt) if args.dt is not None else ((3, 2) if is_sup else None)
+    dilate = args.dilate if args.dilate is not None else (7 if is_sup else None)
+
+    # dataset-specific perlin threshold defaults
+    if args.perlin_thr is not None:
+        perlin_thr = args.perlin_thr
+    elif args.dataset == "mvtec":
+        perlin_thr = 0.2
+    else:
+        perlin_thr = 0.6
+
+    config = {
+        "wandb_project": args.wandb_project,
+        "datasets_folder": args.datasets_folder,
+        "num_workers": args.num_workers,
+        "setup_name": args.setup_name,
+        "backbone": args.backbone,
+        "layers": args.layers,
+        "patch_size": args.patch_size,
+        "noise": args.noise,
+        "perlin": args.perlin,
+        "no_anomaly": args.no_anomaly,
+        "bad": args.bad,
+        "overlap": args.overlap,
+        "adapt_cls_feat": args.adapt_cls_feat,
+        "noise_std": args.noise_std,
+        "perlin_thr": perlin_thr,
+        "image_size": tuple(args.image_size),
+        "seed": args.seed,
+        "batch": args.batch,
+        "epochs": args.epochs,
+        "flips": flips,
+        "seg_lr": args.seg_lr,
+        "dec_lr": args.dec_lr,
+        "adapt_lr": args.adapt_lr,
+        "gamma": args.gamma,
+        "stop_grad": stop_grad,
+        "clip_grad": clip_grad,
+        "eval_step_size": args.eval_step_size,
+        "results_save_path": args.results_dir,
+        "run_name": args.run_name,
+        "dt": dt,
+        "dilate": dilate,
+        "use_amp": args.amp,
+    }
+
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
 
 def train(
     model: SuperSimpleNet,
@@ -45,18 +340,41 @@ def train(
     th: float = 0.5,
     clip_grad: bool = True,
     eval_step_size: int = 4,
+    use_amp: bool = False,
+    exp: "ExperimentDir" = None,
 ):
+    log = get_logger()
     model.to(device)
     optimizer, scheduler = model.get_optimizers()
 
+    amp_enabled = use_amp and device == "cuda"
+    if use_amp and not amp_enabled:
+        log.warning("  AMP requested but device is CPU — AMP disabled.")
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    autocast_device = "cuda" if device == "cuda" else "cpu"
+
+    log.info("")
+    log.info("╔═══════════════════════════════════════════════════════════╗")
+    log.info("║                     Training Started                     ║")
+    log.info("╚═══════════════════════════════════════════════════════════╝")
+    log.info("  Epochs: %d   Eval every: %d epochs   Device: %s",
+             epochs, eval_step_size, device)
+    log.info("  Gradient clipping: %s", clip_grad)
+    log.info("  Mixed precision (AMP): %s", "ENABLED (fp16)" if amp_enabled else "DISABLED")
+    log.info("")
+
+    results = {}
     model.train()
     train_loader = datamodule.train_dataloader()
+
     for epoch in range(epochs):
         model.train()
         total_loss = 0
+        log.info("─── Training: Epoch %d / %d ──────────────────────────────────", epoch + 1, epochs)
+
         with tqdm(
             total=len(train_loader),
-            desc=str(epoch) + "/" + str(epochs),
+            desc=f"Epoch {epoch + 1}/{epochs}",
             miniters=int(1),
             unit="batch",
         ) as prog_bar:
@@ -80,71 +398,75 @@ def train(
                 label = batch["label"].to(device).type(torch.float32)
                 is_segmented = batch["is_segmented"].to(device).type(torch.float32)
 
-                anomaly_map, score, mask, label = model.forward(
-                    image_batch, mask, label
-                )
-
-                seg_focal = focal_loss(torch.sigmoid(anomaly_map), mask, reduction=None)
-
-                # use this shape to apply weights from distance transform if enabled
-                seg_l1 = torch.zeros_like(anomaly_map)
-
-                # adjusted truncated l1: mask + flipped sign (ano->pos, good->neg)
-                normal_scores = anomaly_map[mask == 0]
-                seg_l1[mask == 0] = torch.clip(normal_scores + th, min=0)
-
-                anomalous_scores = anomaly_map[mask > 0]
-                seg_l1[mask > 0] = torch.clip(-anomalous_scores + th, min=0)
-
-                if "loss_mask" in batch:
-                    loss_mask = batch["loss_mask"].type(torch.float32).to(device)
-
-                    # resize loss_mask to fit the loss
-                    loss_mask = F.interpolate(
-                        loss_mask.unsqueeze(1),
-                        size=seg_focal.shape[-2:],
-                        mode="bilinear",
-                        align_corners=True,
+                with torch.autocast(device_type=autocast_device, dtype=torch.float16, enabled=amp_enabled):
+                    anomaly_map, score, mask, label = model.forward(
+                        image_batch, mask, label
                     )
 
-                    # due to feat. duplication stack mask and multiply to get weighted loss
-                    loss_mask = torch.cat((loss_mask, loss_mask))
-                    seg_focal *= loss_mask
-                    seg_l1 *= loss_mask
+                    seg_focal = focal_loss(anomaly_map, mask, reduction=None)
 
-                # due to feat. duplication
-                is_segmented = torch.cat((is_segmented, is_segmented)).type(torch.bool)
+                    # use this shape to apply weights from distance transform if enabled
+                    seg_l1 = torch.zeros_like(anomaly_map)
 
-                bad_loss = seg_l1[is_segmented][mask[is_segmented] > 0]
-                good_loss = seg_l1[is_segmented][mask[is_segmented] == 0]
-                focal_val = seg_focal[is_segmented]
+                    # adjusted truncated l1: mask + flipped sign (ano->pos, good->neg)
+                    normal_scores = anomaly_map[mask == 0]
+                    seg_l1[mask == 0] = torch.clip(normal_scores + th, min=0)
 
-                if len(good_loss):
-                    good_loss = good_loss.mean()
-                else:
-                    good_loss = 0
-                if len(bad_loss):
-                    bad_loss = bad_loss.mean()
-                else:
-                    bad_loss = 0
-                if len(focal_val):
-                    focal_val = focal_val.mean()
-                else:
-                    focal_val = 0
+                    anomalous_scores = anomaly_map[mask > 0]
+                    seg_l1[mask > 0] = torch.clip(-anomalous_scores + th, min=0)
 
-                # seg loss is combination of trunc l1 and focal (separately avg each l1 part due to unbalanced pixels)
-                seg_loss = good_loss + bad_loss + focal_val
+                    if "loss_mask" in batch:
+                        loss_mask = batch["loss_mask"].type(torch.float32).to(device)
 
-                loss = seg_loss + focal_loss(torch.sigmoid(score), label)
+                        # resize loss_mask to fit the loss
+                        loss_mask = F.interpolate(
+                            loss_mask.unsqueeze(1),
+                            size=seg_focal.shape[-2:],
+                            mode="bilinear",
+                            align_corners=True,
+                        )
 
-                loss.backward()
+                        # due to feat. duplication stack mask and multiply to get weighted loss
+                        loss_mask = torch.cat((loss_mask, loss_mask))
+                        seg_focal *= loss_mask
+                        seg_l1 *= loss_mask
+
+                    # due to feat. duplication
+                    is_segmented = torch.cat((is_segmented, is_segmented)).type(torch.bool)
+
+                    bad_loss = seg_l1[is_segmented][mask[is_segmented] > 0]
+                    good_loss = seg_l1[is_segmented][mask[is_segmented] == 0]
+                    focal_val = seg_focal[is_segmented]
+
+                    if len(good_loss):
+                        good_loss = good_loss.mean()
+                    else:
+                        good_loss = 0
+                    if len(bad_loss):
+                        bad_loss = bad_loss.mean()
+                    else:
+                        bad_loss = 0
+                    if len(focal_val):
+                        focal_val = focal_val.mean()
+                    else:
+                        focal_val = 0
+
+                    # seg loss is combination of trunc l1 and focal (separately avg each l1 part due to unbalanced pixels)
+                    seg_loss = good_loss + bad_loss + focal_val
+
+                    loss = seg_loss + focal_loss(score, label)
+
+                scaler.scale(loss).backward()
 
                 if clip_grad:
+                    # must unscale before clipping so the norm is in the original gradient space
+                    scaler.unscale_(optimizer)
                     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1)
                 else:
                     norm = None
 
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
 
                 total_loss += loss.detach().cpu().item()
 
@@ -157,7 +479,22 @@ def train(
                 prog_bar.set_postfix(**output)
                 prog_bar.update(1)
 
+            avg_loss = total_loss / len(train_loader)
+            lrs = [pg["lr"] for pg in optimizer.param_groups]
+            log.info(
+                "  Epoch %d done  |  avg_loss=%.5f  |  grad_norm=%s  |  lr(adapt/seg/dec)=%.6f/%.6f/%.6f",
+                epoch + 1,
+                avg_loss,
+                f"{norm:.4f}" if norm is not None else "N/A",
+                lrs[0], lrs[1], lrs[2],
+            )
+            log.debug("  Epoch %d raw output: %s", epoch + 1, output)
+
+            if exp is not None:
+                exp.append_loss(epoch + 1, avg_loss, lrs, norm)
+
             if (epoch + 1) % eval_step_size == 0:
+                log.info("─── Evaluation at Epoch %d / %d ──────────────────────────", epoch + 1, epochs)
                 results = test(
                     model=model,
                     datamodule=datamodule,
@@ -166,15 +503,22 @@ def train(
                     pixel_metrics=pixel_metrics,
                     normalize=True,
                 )
+                if exp is not None:
+                    exp.append_metrics_history(epoch + 1, results)
                 if LOG_WANDB:
                     wandb.log({**results, **output})
             else:
                 if LOG_WANDB:
                     wandb.log(output)
+
         scheduler.step()
 
     return results
 
+
+# ---------------------------------------------------------------------------
+# Evaluation
+# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def test(
@@ -186,7 +530,9 @@ def test(
     normalize: bool = True,
     image_save_path: Path = None,
     score_save_path: Path = None,
+    exp: "ExperimentDir" = None,
 ):
+    log = get_logger()
     model.to(device)
     model.eval()
 
@@ -196,7 +542,6 @@ def test(
     for m_name, metric in image_metrics.items():
         metric.cpu()
         metric.reset()
-
         seg_image_metrics[f"seg-{m_name}"] = copy.deepcopy(metric)
 
     for metric in pixel_metrics.values():
@@ -204,6 +549,13 @@ def test(
         metric.reset()
 
     test_loader = datamodule.test_dataloader()
+    n_normal = datamodule.test_data.num_neg
+    n_anomalous = datamodule.test_data.num_pos
+    n_total = n_normal + n_anomalous
+
+    log.info("  Test set:  %d images total  (%d normal / %d anomalous)",
+             n_total, n_normal, n_anomalous)
+
     results = {
         "anomaly_map": [],
         "gt_mask": [],
@@ -213,7 +565,7 @@ def test(
         "image_path": [],
         "mask_path": [],
     }
-    for batch in tqdm(test_loader, position=0, leave=True):
+    for batch in tqdm(test_loader, position=0, leave=True, desc="Evaluating"):
         image_batch = batch["image"].to(device)
         anomaly_map, anomaly_score = model.forward(image_batch)
 
@@ -280,54 +632,114 @@ def test(
             results_dict[name] = 0
         metric.to("cpu")
 
+    log.info("  ┌─────────────────────────────┐")
+    for name, value in results_dict.items():
+        log.info("  │  %-20s  %6.4f  │", name, value)
+    log.info("  └─────────────────────────────┘")
+
+    # legacy per-line print kept for tqdm compatibility
     for name, value in results_dict.items():
         print(f"{name}: {value} ", end="")
     print()
 
-    if image_save_path:
-        print("Visualizing")
-        visualizer = Visualizer(image_save_path)
-        visualizer.visualize(results)
+    # Compute best-F1 threshold and per-image predicted labels
+    max_f1_metric = image_metrics.get("I-MaxF1")
+    if max_f1_metric is not None:
+        best_threshold = max_f1_metric.compute_threshold()
+    else:
+        best_threshold = 0.5
+    predicted_labels = (results["score"] >= best_threshold).long()
+    results["predicted_label"] = predicted_labels
 
-    score_dict = {}
-    if score_save_path:
-        # save both segscore and score to json
-        for img_path, score, seg_score, label in zip(
+    # Build the legacy nested score dict (kept for backward compat)
+    score_dict: dict = {}
+    for img_path, score, seg_score, label in zip(
+        results["image_path"],
+        results["score"],
+        results["seg_score"],
+        results["label"],
+    ):
+        img_path = Path(img_path)
+        anomaly_type = img_path.parent.name
+        if anomaly_type not in score_dict:
+            score_dict[anomaly_type] = {"good": {}, "bad": {}}
+        kind = "bad" if label == 1 else "good"
+        score_dict[anomaly_type][kind][img_path.stem] = {
+            "score": score.item(),
+            "seg_score": seg_score.item(),
+        }
+
+    if exp is not None:
+        # Rich per-image CSV with classification outcome
+        per_image_rows = []
+        for img_path, score, seg_score, gt_label, pred_label in zip(
             results["image_path"],
             results["score"],
             results["seg_score"],
             results["label"],
+            predicted_labels,
         ):
-            img_path = Path(img_path)
+            per_image_rows.append({
+                "image_name": Path(img_path).name,
+                "defect_type": Path(img_path).parent.name,
+                "ground_truth_label": gt_label.item(),
+                "predicted_label": pred_label.item(),
+                "score": round(score.item(), 6),
+                "seg_score": round(seg_score.item(), 6),
+                "is_correct": int(gt_label.item() == pred_label.item()),
+            })
 
-            anomaly_type = img_path.parent.name
-            if anomaly_type not in score_dict:
-                score_dict[anomaly_type] = {"good": {}, "bad": {}}
+        exp.save_per_image_scores(per_image_rows)
+        exp.save_scores_json(score_dict)
+        exp.save_summary_metrics(results_dict)
+        exp.save_by_defect_metrics(per_image_rows)
 
-            # since some datasets (sensum) can have same names in bad and good
-            if label == 1:
-                kind = "bad"
-            else:
-                kind = "good"
+        log.info("  Saving visualizations → %s", exp.visual)
+        outcome_dirs = {
+            "TP": exp.tp_dir,
+            "FP": exp.fp_dir,
+            "TN": exp.tn_dir,
+            "FN": exp.fn_dir,
+        }
+        visualizer = Visualizer(exp.visual)
+        visualizer.visualize(results, outcome_dirs=outcome_dirs)
+    else:
+        if image_save_path:
+            log.info("  Saving visualizations → %s", image_save_path)
+            visualizer = Visualizer(image_save_path)
+            visualizer.visualize(results)
 
-            score_dict[anomaly_type][kind][img_path.stem] = {
-                "score": score.item(),
-                "seg_score": seg_score.item(),
-            }
-
-        score_save_path.mkdir(exist_ok=True, parents=True)
-        with open(score_save_path / "scores.json", "w") as f:
-            json.dump(score_dict, f)
+        if score_save_path:
+            score_save_path.mkdir(exist_ok=True, parents=True)
+            with open(score_save_path / "scores.json", "w") as f:
+                json.dump(score_dict, f)
+            log.info("  Scores saved → %s/scores.json", score_save_path)
 
     return results_dict
 
 
+# ---------------------------------------------------------------------------
+# train + eval wrapper
+# ---------------------------------------------------------------------------
+
 def train_and_eval(model, datamodule, config, device):
+    log = get_logger()
+
+    exp = ExperimentDir(Path(config["results_save_path"]), config)
+    exp.create_dirs()
+    exp.save_config(config)
+    exp.add_file_logging()
+
+    log.info("")
+    log.info("  Experiment dir: %s", exp.root)
+    log.info("")
+
     if LOG_WANDB:
         os.environ["WANDB__SERVICE_WAIT"] = "300"
         wandb.init(project=config["wandb_project"], config=config, name=config["name"])
 
     image_metrics = {
+        "I-MaxF1": MaxF1Score(),
         "I-AUROC": AUROC(),
         "AP-det": AveragePrecision(num_classes=1),
     }
@@ -346,22 +758,19 @@ def train_and_eval(model, datamodule, config, device):
         pixel_metrics=pixel_metrics,
         clip_grad=config["clip_grad"],
         eval_step_size=config["eval_step_size"],
+        use_amp=config.get("use_amp", False),
+        exp=exp,
     )
     if LOG_WANDB:
         wandb.finish()
 
     try:
-        model.save_model(
-            Path(config["results_save_path"])
-            / config["setup_name"]
-            / "checkpoints"
-            / config["dataset"]
-            / config["category"]
-            / str(config["ratio"]),
-        )
+        model.save_model(exp.checkpoints)
     except Exception as e:
-        print("Error saving checkpoint" + str(e))
+        log.warning("Error saving checkpoint: %s", e)
 
+    log.info("")
+    log.info("─── Final Evaluation ────────────────────────────────────────")
     results = test(
         model=model,
         datamodule=datamodule,
@@ -369,65 +778,46 @@ def train_and_eval(model, datamodule, config, device):
         image_metrics=image_metrics,
         pixel_metrics=pixel_metrics,
         normalize=True,
-        image_save_path=Path(config["results_save_path"])
-        / config["setup_name"]
-        / "visual"
-        / config["dataset"]
-        / config["category"]
-        / str(config["ratio"]),
-        score_save_path=Path(config["results_save_path"])
-        / config["setup_name"]
-        / "scores"
-        / config["dataset"]
-        / config["category"]
-        / str(config["ratio"]),
+        exp=exp,
     )
+
+    log.info("")
+    log.info("─── Run Complete ────────────────────────────────────────────")
+    log.info("  Experiment dir: %s", exp.root)
+    log.info("─────────────────────────────────────────────────────────────")
 
     return results
 
 
+# ---------------------------------------------------------------------------
+# Per-dataset main functions
+# ---------------------------------------------------------------------------
+
 def main_mvtec(device, config):
+    log = get_logger()
     config = copy.deepcopy(config)
     config["dataset"] = "mvtec"
     config["ratio"] = 1
 
     categories = [
-        "screw",
-        "pill",
-        "capsule",
-        "carpet",
-        "grid",
-        "tile",
-        "wood",
-        "zipper",
-        "cable",
-        "toothbrush",
-        "transistor",
-        "metal_nut",
-        "bottle",
-        "hazelnut",
-        "leather",
+        "screw", "pill", "capsule", "carpet", "grid", "tile", "wood",
+        "zipper", "cable", "toothbrush", "transistor", "metal_nut",
+        "bottle", "hazelnut", "leather",
     ]
 
     results_writer = ResultsWriter(
-        metrics=[
-            "AP-det",
-            "AP-loc",
-            "P-AUROC",
-            "I-AUROC",
-            "AUPRO",
-            "seg-AP-det",
-            "seg-I-AUROC",
-        ]
+        metrics=["AP-det", "AP-loc", "P-AUROC", "I-MaxF1", "I-AUROC", "AUPRO", "seg-AP-det", "seg-I-AUROC", "seg-I-MaxF1"]
     )
 
     for category in categories:
-        print(f"Training on {category}")
+        log.info("")
+        log.info("╔═══════════════════════════════════════════════════════════╗")
+        log.info("║  Dataset: MVTec   Category: %-29s ║", category)
+        log.info("╚═══════════════════════════════════════════════════════════╝")
 
         config["category"] = category
         config["name"] = f"{category}_{config['setup_name']}"
 
-        # deterministic
         seed_everything(config["seed"], workers=True)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
@@ -445,56 +835,34 @@ def main_mvtec(device, config):
         )
         datamodule.setup()
 
-        results = train_and_eval(
-            model=model, datamodule=datamodule, config=config, device=device
-        )
+        results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device)
 
-        results_writer.add_result(
-            category=category,
-            last=results,
-        )
+        results_writer.add_result(category=category, last=results)
         results_writer.save(
-            Path(config["results_save_path"])
-            / config["setup_name"]
-            / config["dataset"]
-            / str(config["ratio"])
+            Path(config["results_save_path"]) / "aggregated" / config["dataset"]
         )
 
 
 def main_visa(device, config):
+    log = get_logger()
     config = copy.deepcopy(config)
     config["dataset"] = "visa"
     config["ratio"] = 1
 
     categories = [
-        "candle",
-        "capsules",
-        "cashew",
-        "chewinggum",
-        "fryum",
-        "macaroni1",
-        "macaroni2",
-        "pcb1",
-        "pcb2",
-        "pcb3",
-        "pcb4",
-        "pipe_fryum",
+        "candle", "capsules", "cashew", "chewinggum", "fryum",
+        "macaroni1", "macaroni2", "pcb1", "pcb2", "pcb3", "pcb4", "pipe_fryum",
     ]
 
     results_writer = ResultsWriter(
-        metrics=[
-            "AP-det",
-            "AP-loc",
-            "P-AUROC",
-            "I-AUROC",
-            "AUPRO",
-            "seg-AP-det",
-            "seg-I-AUROC",
-        ]
+        metrics=["AP-det", "AP-loc", "P-AUROC", "I-MaxF1", "I-AUROC", "AUPRO", "seg-AP-det", "seg-I-AUROC", "seg-I-MaxF1"]
     )
 
     for category in categories:
-        print(f"Training on {category}")
+        log.info("")
+        log.info("╔═══════════════════════════════════════════════════════════╗")
+        log.info("║  Dataset: VisA    Category: %-29s ║", category)
+        log.info("╚═══════════════════════════════════════════════════════════╝")
 
         config["category"] = category
         config["name"] = f"{category}_{config['setup_name']}"
@@ -516,40 +884,29 @@ def main_visa(device, config):
         )
         datamodule.setup()
 
-        results = train_and_eval(
-            model=model, datamodule=datamodule, config=config, device=device
-        )
+        results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device)
 
-        results_writer.add_result(
-            category=category,
-            last=results,
-        )
+        results_writer.add_result(category=category, last=results)
         results_writer.save(
-            Path(config["results_save_path"])
-            / config["setup_name"]
-            / config["dataset"]
-            / str(config["ratio"])
+            Path(config["results_save_path"]) / "aggregated" / config["dataset"]
         )
 
 
 def main_ksdd2(device, config, supervision):
+    log = get_logger()
     config = copy.deepcopy(config)
     config["dataset"] = "ksdd2"
     config["category"] = "ksdd2"
     config["name"] = f"ksdd2_{config['setup_name']}"
 
     results_writer = ResultsWriter(
-        metrics=[
-            "AP-det",
-            "AP-loc",
-            "P-AUROC",
-            "I-AUROC",
-            "AUPRO",
-            "seg-AP-det",
-            "seg-I-AUROC",
-            "ratio",
-        ]
+        metrics=["AP-det", "AP-loc", "P-AUROC", "I-MaxF1", "I-AUROC", "AUPRO", "seg-AP-det", "seg-I-AUROC", "seg-I-MaxF1", "ratio"]
     )
+
+    log.info("")
+    log.info("╔═══════════════════════════════════════════════════════════╗")
+    log.info("║  Dataset: KSDD2   Ratio: %-33s ║", config.get("ratio", "?"))
+    log.info("╚═══════════════════════════════════════════════════════════╝")
 
     seed_everything(config["seed"], workers=True)
     torch.backends.cudnn.deterministic = True
@@ -572,49 +929,36 @@ def main_ksdd2(device, config, supervision):
     )
     datamodule.setup()
 
-    results = train_and_eval(
-        model=model, datamodule=datamodule, config=config, device=device
-    )
+    results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device)
 
     results["ratio"] = config["ratio"]
-    results_writer.add_result(
-        category="ksdd2",
-        last=results,
-    )
+    results_writer.add_result(category="ksdd2", last=results)
     results_writer.save(
-        Path(config["results_save_path"])
-        / config["setup_name"]
-        / config["dataset"]
-        / str(config["ratio"])
+        Path(config["results_save_path"]) / "aggregated" / config["dataset"]
     )
 
 
 def main_sensum(device, config, supervision):
+    log = get_logger()
     config = copy.deepcopy(config)
     config["dataset"] = "sensum"
 
     results_writer = ResultsWriter(
-        metrics=[
-            "AP-det",
-            "AP-loc",
-            "P-AUROC",
-            "I-AUROC",
-            "AUPRO",
-            "seg-AP-det",
-            "seg-I-AUROC",
-            "fold",
-            "ratio",
-        ]
+        metrics=["AP-det", "AP-loc", "P-AUROC", "I-MaxF1", "I-AUROC", "AUPRO", "seg-AP-det", "seg-I-AUROC", "seg-I-MaxF1", "fold", "ratio"]
     )
 
     for category in [sensum.Category.Capsule, sensum.Category.Softgel]:
-        print(f"Training on {category.value}")
+        log.info("")
+        log.info("╔═══════════════════════════════════════════════════════════╗")
+        log.info("║  Dataset: Sensum  Category: %-29s ║", category.value)
+        log.info("╚═══════════════════════════════════════════════════════════╝")
 
         seed_everything(config["seed"], workers=True)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
         for fold_num in range(3):
+            log.info("  ─── Fold %d / 3 ────────────────────────────────────────", fold_num + 1)
             config["category"] = f"{category.value}_{fold_num}"
             config["name"] = f"{category.value}_{config['setup_name']}_{fold_num}"
             config["fold"] = fold_num
@@ -640,120 +984,196 @@ def main_sensum(device, config, supervision):
             )
             datamodule.setup()
 
-            results = train_and_eval(
-                model=model, datamodule=datamodule, config=config, device=device
-            )
+            results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device)
 
-            # also log fold as a separate column
             results["fold"] = fold_num
             results["ratio"] = config["ratio"]
-            results_writer.add_result(
-                category=f"{category.value}",
-                last=results,
-            )
+            results_writer.add_result(category=f"{category.value}", last=results)
             results_writer.save(
-                Path(config["results_save_path"])
-                / config["setup_name"]
-                / config["dataset"]
-                / str(config["ratio"])
+                Path(config["results_save_path"]) / "aggregated" / config["dataset"]
             )
 
 
-def run_unsup(data_name):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def main_custom(
+    device,
+    config,
+    custom_root: Path,
+    good_test_split: float,
+    defect_train_split: float,
+    category_name: str,
+    supervision: Supervision = Supervision.UNSUPERVISED,
+):
+    log = get_logger()
+    config = copy.deepcopy(config)
+    config["dataset"] = "custom"
+    config["ratio"] = 1
+    config["category"] = category_name
+    config["name"] = f"{category_name}_{config['setup_name']}"
 
-    config = {
-        "wandb_project": "ssn",
-        "datasets_folder": Path("./datasets"),
-        "num_workers": 8,
-        "setup_name": "superSimpleNet",
-        "backbone": "wide_resnet50_2",
-        "layers": ["layer2", "layer3"],
-        "patch_size": 3,
-        "noise": True,
-        "perlin": True,
-        "no_anomaly": "empty",
-        "bad": True,
-        "overlap": True,  # makes no difference, just faster if false to avoid computation
-        "adapt_cls_feat": False,  # (JIMS extension) cls features are not adapted
-        "noise_std": 0.015,
-        # "perlin_thr": x,
-        "image_size": (256, 256),
-        "seed": 42,
-        "batch": 32,
-        "epochs": 300,
-        "flips": False,  # makes no difference, just faster if false to avoid computation
-        "seg_lr": 0.0002,
-        "dec_lr": 0.0002,
-        "adapt_lr": 0.0001,
-        "gamma": 0.4,
-        "stop_grad": True,
-        "clip_grad": False,
-        "eval_step_size": 4,
-        "results_save_path": Path("./results"),
-    }
-    if data_name == "visa":
-        config["perlin_thr"] = 0.6
-        main_visa(device=device, config=config)
-    if data_name == "mvtec":
-        config["perlin_thr"] = 0.2
-        main_mvtec(device=device, config=config)
+    results_writer = ResultsWriter(
+        metrics=["AP-det", "AP-loc", "P-AUROC", "I-MaxF1", "I-AUROC", "AUPRO", "seg-AP-det", "seg-I-AUROC", "seg-I-MaxF1"]
+    )
+
+    log.info("")
+    log.info("╔═══════════════════════════════════════════════════════════╗")
+    log.info("║  Dataset: Custom  Category: %-29s ║", category_name)
+    log.info("╚═══════════════════════════════════════════════════════════╝")
+    log.info("  Root:            %s", custom_root)
+    log.info("  Supervision:     %s", supervision.value)
+    log.info("  Good-test split:   %.0f%%", good_test_split * 100)
+    log.info("  Defect-train split:%.0f%%", defect_train_split * 100)
+    log.info("  AMP:               %s", config.get("use_amp", False))
+
+    seed_everything(config["seed"], workers=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    model = SuperSimpleNet(image_size=config["image_size"], config=config)
+
+    datamodule = Custom(
+        root=custom_root,
+        image_size=config["image_size"],
+        supervision=supervision,
+        train_batch_size=config["batch"],
+        eval_batch_size=config["batch"],
+        num_workers=config["num_workers"],
+        seed=config["seed"],
+        good_test_split=good_test_split,
+        defect_train_split=defect_train_split,
+        flips=config.get("flips", False),
+    )
+    datamodule.setup()
+
+    results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device)
+
+    results_writer.add_result(category=category_name, last=results)
+    results_writer.save(
+        Path(config["results_save_path"]) / "aggregated" / config["dataset"]
+    )
 
 
-def run_sup(data_name):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    config = {
-        "wandb_project": "ssn",
-        "datasets_folder": Path("./datasets"),
-        "num_workers": 1,
-        "setup_name": "superSimpleNet",
-        "dt": (3, 2),   # distance transform
-        "dilate": 7,    # dilate mask
-        "backbone": "wide_resnet50_2",
-        "layers": ["layer2", "layer3"],
-        "patch_size": 3,
-        "noise": True,
-        "perlin": True,
-        "no_anomaly": "empty",
-        "bad": True,
-        "overlap": False,
-        "adapt_cls_feat": False,  # (JIMS extension) cls features are not adapted
-        "noise_std": 0.015,
-        "perlin_thr": 0.6,
-        "seed": 456654,
-        "batch": 32,
-        "epochs": 300,
-        "flips": True,
-        "seg_lr": 0.0002,
-        "dec_lr": 0.0002,
-        "adapt_lr": 0.0001,
-        "gamma": 0.4,
-        "stop_grad": False,
-        "clip_grad": True,
-        "eval_step_size": 4,
-        "results_save_path": Path("./results"),
-    }
-    if data_name == "sensum":
-        config["ratio"] = RatioSegmented.M100.value
-
-        if float(config["ratio"]) == 0:
-            config["perlin_thr"] = 0.2
-        main_sensum(
-            device=device, config=config, supervision=Supervision.MIXED_SUPERVISION
-        )
-    if data_name == "ksdd2":
-        config["ratio"] = NumSegmented.N246.value
-
-        if float(config["ratio"]) == 0:
-            config["perlin_thr"] = 0.2
-        main_ksdd2(
-            device=device, config=config, supervision=Supervision.MIXED_SUPERVISION
-        )
-
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
-    run_unsup(sys.argv[1])
-    run_sup(sys.argv[1])
+    args = parse_args()
+
+    if args.dataset == "custom":
+        if args.data_root is None:
+            print(
+                "ERROR: --data-root is required when --dataset custom.\n"
+                "  Pass the path to your dataset on the command line, e.g.:\n"
+                "    python train.py @configs/custom_fully_sup.txt --data-root /path/to/your/data",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not args.data_root.exists():
+            print(
+                f"ERROR: --data-root path does not exist: {args.data_root}\n"
+                "  Check the path and try again.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not args.data_root.is_dir():
+            print(
+                f"ERROR: --data-root is not a directory: {args.data_root}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        for expected in ("train", "test"):
+            if not (args.data_root / expected).exists():
+                print(
+                    f"WARNING: --data-root is missing expected subfolder '{expected}/': {args.data_root}",
+                    file=sys.stderr,
+                )
+
+    config = _build_config(args)
+    config["dataset"] = args.dataset
+
+    log = setup_logger()  # console only; file handler attached inside train_and_eval
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+    else:
+        gpu_name = "CPU"
+
+    log.info("")
+    log.info("╔═══════════════════════════════════════════════════════════╗")
+    log.info("║          SuperSimpleNet — Training Run                    ║")
+    log.info("╚═══════════════════════════════════════════════════════════╝")
+    log.info("  Dataset:        %s  (%s mode)", args.dataset, args.mode)
+    log.info("  Image size:     %d x %d", config["image_size"][0], config["image_size"][1])
+    log.info("  Epochs:         %d  (eval every %d)", config["epochs"], config["eval_step_size"])
+    log.info("  Batch size:     %d", config["batch"])
+    log.info("  Seed:           %d", config["seed"])
+    log.info("  Device:         %s (%s)", device.upper(), gpu_name)
+    log.info("  Results dir:    %s/", config["results_save_path"])
+    log.info("  Log file:       written inside per-experiment dir")
+    log.info("")
+    log.info("  Full config:")
+    for k, v in config.items():
+        log.info("    %-22s %s", k + ":", v)
+    log.info("")
+
+    if args.dataset == "mvtec":
+        if args.perlin_thr is None:
+            config["perlin_thr"] = 0.2
+        config["supervision_str"] = Supervision.UNSUPERVISED.value
+        main_mvtec(device=device, config=config)
+
+    elif args.dataset == "visa":
+        if args.perlin_thr is None:
+            config["perlin_thr"] = 0.6
+        config["supervision_str"] = Supervision.UNSUPERVISED.value
+        main_visa(device=device, config=config)
+
+    elif args.dataset == "ksdd2":
+        ratio = args.ratio if args.ratio is not None else NumSegmented.N246.value
+        if float(ratio) == 0 and args.perlin_thr is None:
+            config["perlin_thr"] = 0.2
+        config["ratio"] = ratio
+        config["supervision_str"] = Supervision.MIXED_SUPERVISION.value
+        main_ksdd2(
+            device=device,
+            config=config,
+            supervision=Supervision.MIXED_SUPERVISION,
+        )
+
+    elif args.dataset == "sensum":
+        ratio = args.ratio if args.ratio is not None else RatioSegmented.M100.value
+        if float(ratio) == 0 and args.perlin_thr is None:
+            config["perlin_thr"] = 0.2
+        config["ratio"] = ratio
+        config["supervision_str"] = Supervision.MIXED_SUPERVISION.value
+        main_sensum(
+            device=device,
+            config=config,
+            supervision=Supervision.MIXED_SUPERVISION,
+        )
+
+    elif args.dataset == "custom":
+        _sup_map = {
+            "unsupervised": Supervision.UNSUPERVISED,
+            "weakly":       Supervision.WEAKLY_SUPERVISED,
+            "mixed":        Supervision.MIXED_SUPERVISION,
+            "fully":        Supervision.FULLY_SUPERVISED,
+        }
+        sup_str = args.supervision or ("unsupervised" if args.mode == "unsup" else "mixed")
+        supervision = _sup_map[sup_str]
+        config["supervision_str"] = supervision.value
+
+        category_name = args.category or args.data_root.name
+        main_custom(
+            device=device,
+            config=config,
+            custom_root=args.data_root,
+            good_test_split=args.good_test_split,
+            defect_train_split=args.defect_train_split,
+            category_name=category_name,
+            supervision=supervision,
+        )
 
 
 if __name__ == "__main__":

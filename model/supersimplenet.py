@@ -1,3 +1,4 @@
+import logging
 import math
 from collections import OrderedDict
 from pathlib import Path
@@ -12,6 +13,8 @@ from torchvision.transforms import GaussianBlur
 
 from common.perlin_noise import rand_perlin_2d
 from .feature_extractor import FeatureExtractor
+
+_log = logging.getLogger("ssn")
 
 
 class SuperSimpleNet(nn.Module):
@@ -59,6 +62,35 @@ class SuperSimpleNet(nn.Module):
         self.anomaly_map_generator = AnomalyMapGenerator(
             output_size=image_size, sigma=4
         )
+
+        self._log_model_info()
+
+    def _log_model_info(self) -> None:
+        fc, fh, fw = self.feature_extractor.feature_dim
+        adaptor_params = sum(p.numel() for p in self.feature_adaptor.parameters())
+        seg_params, dec_params = self.discriminator.get_params()
+        seg_n = sum(p.numel() for p in seg_params)
+        dec_n = sum(p.numel() for p in dec_params)
+        total = adaptor_params + seg_n + dec_n
+
+        _log.info("─── Model: SuperSimpleNet ───────────────────────────────────")
+        _log.info("  Backbone:         %s  (ImageNet pretrained, frozen)", self.config.get("backbone", "wide_resnet50_2"))
+        _log.info("  Feature layers:   %s", self.config.get("layers", ["layer2", "layer3"]))
+        _log.info("  Patch size:       %d  (avg-pool kernel)", self.config.get("patch_size", 3))
+        _log.info("  Feature map:      %d x %d  (channels=%d) at %dx%d input", fh, fw, fc, self.image_size[0], self.image_size[1])
+        _log.info("")
+        _log.info("  Trainable parameters:")
+        _log.info("    Feature Adaptor:   %10s", f"{adaptor_params:,}")
+        _log.info("    Discriminator Seg: %10s", f"{seg_n:,}")
+        _log.info("    Discriminator Dec: %10s", f"{dec_n:,}")
+        _log.info("    Total:             %10s  (~%.2fM)", f"{total:,}", total / 1e6)
+        _log.info("")
+        _log.info("  Anomaly generation:")
+        _log.info("    Gaussian noise:   %s  (std=%.4f)", self.config.get("noise", True), self.config.get("noise_std", 0.015))
+        _log.info("    Perlin noise:     %s  (thr=%.2f)", self.config.get("perlin", True), self.config.get("perlin_thr", 0.2))
+        _log.info("    No-anomaly mode:  %s", self.config.get("no_anomaly", "empty"))
+        _log.info("    Stop gradient:    %s", self.config.get("stop_grad", False))
+        _log.info("─────────────────────────────────────────────────────────────")
 
     def forward(
         self,
@@ -131,11 +163,17 @@ class SuperSimpleNet(nn.Module):
                 },
             ]
         )
-        sched = MultiStepLR(
-            optim,
-            milestones=[self.config["epochs"] * 0.8, self.config["epochs"] * 0.9],
-            gamma=self.config["gamma"],
-        )
+        milestones = [self.config["epochs"] * 0.8, self.config["epochs"] * 0.9]
+        sched = MultiStepLR(optim, milestones=milestones, gamma=self.config["gamma"])
+
+        _log.info("─── Optimizer & Scheduler ───────────────────────────────────")
+        _log.info("  Optimizer:  AdamW")
+        _log.info("    adapt_lr: %.6f   seg_lr: %.6f   dec_lr: %.6f",
+                  self.config["adapt_lr"], self.config["seg_lr"], self.config["dec_lr"])
+        _log.info("  Scheduler:  MultiStepLR  milestones=%s  gamma=%.2f",
+                  [int(m) for m in milestones], self.config["gamma"])
+        _log.info("  Gradient clipping:  %s", self.config.get("clip_grad", False))
+        _log.info("─────────────────────────────────────────────────────────────")
 
         return optim, sched
 
@@ -150,8 +188,10 @@ class SuperSimpleNet(nn.Module):
                 if not n.startswith("feature_extractor")
             }
         )
-
         torch.save(saving_state_dict, path / "weights.pt")
+        _log.info("─── Checkpoint Saved ────────────────────────────────────────")
+        _log.info("  Path: %s/weights.pt", path)
+        _log.info("─────────────────────────────────────────────────────────────")
 
     def load_model(self, path):
         print(f"Loading model: {path}")

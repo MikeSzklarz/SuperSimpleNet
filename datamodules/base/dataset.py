@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 
 import albumentations as A
@@ -11,6 +12,8 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from datamodules.base import Supervision
+
+_log = logging.getLogger("ssn")
 
 
 class SSNDataset(Dataset):
@@ -112,6 +115,14 @@ class SSNDataset(Dataset):
 
         self.num_neg = len(self._normal_samples)
         self.num_pos = len(self._anomalous_samples)
+
+        _log.debug(
+            "%s [%s]: normal=%d  anomalous=%d",
+            type(self).__name__,
+            self.split.value,
+            self.num_neg,
+            self.num_pos,
+        )
 
         if self.supervision != Supervision.UNSUPERVISED:
             # if have positive samples we use frequency sampling
