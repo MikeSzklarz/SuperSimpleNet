@@ -1,14 +1,13 @@
 #!/bin/bash
 
-#SBATCH --job-name=ssn-train
 #SBATCH --output=logs/slurm/%j.out
 #SBATCH --error=logs/slurm/%j.err
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
-#SBATCH --gpus=1
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=0
-#SBATCH --time=50:00:00
-#SBATCH --partition=gpu
+#SBATCH --time=24:00:00
+#SBATCH --exclusive
+#SBATCH --partition=waccamaw
 
 set -e
 
@@ -20,9 +19,10 @@ echo "Environment loaded."
 
 # --- Training ---
 # All arguments passed to sbatch are forwarded here, e.g.:
-#   sbatch run_slurm_train.sh --config configs/custom_fully_sup.txt \
-#                              --data-root /path/to/data \
-#                              --results-dir /path/to/results
+#   sbatch --nodelist=waccamaw01 run_slurm_train.sh \
+#     --config configs/custom_fully_sup.txt \
+#     --data-root /path/to/data \
+#     --results-dir /path/to/results
 echo "Running:"
 echo "  python train.py $@"
 echo ""
