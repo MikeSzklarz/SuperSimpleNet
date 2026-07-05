@@ -37,7 +37,7 @@ from common.results_writer import ResultsWriter
 from common.loss import focal_loss
 from common.logger import setup_logger, add_file_handler, get_logger
 from common.metrics import MaxF1Score
-from common.experiment import ExperimentDir
+from common.experiment import ExperimentDir, _sanitize
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +264,10 @@ def parse_args() -> argparse.Namespace:
     sup.add_argument("--dilate", type=int, default=None,
                      help="Mask dilation kernel size (default: 7 for sup mode)")
     sup.add_argument("--ratio", type=float, default=None,
-                     help="Fraction/count of segmented samples for sup datasets")
+                     help="Labeled-defect knob: ksdd2 = count of segmented samples (0/16/53/126/246), "
+                          "sensum = fraction segmented (0.0-1.0), custom = fraction of masked training "
+                          "defects that keep their masks (0.0-1.0, mixed supervision only; "
+                          "weakly forces 0, fully ignores it; default 1.0)")
 
     return parser.parse_args(_load_config_files(sys.argv[1:]))
 
@@ -1002,11 +1005,12 @@ def main_custom(
     defect_train_split: float,
     category_name: str,
     supervision: Supervision = Supervision.UNSUPERVISED,
+    mask_ratio: float = 1.0,
 ):
     log = get_logger()
     config = copy.deepcopy(config)
     config["dataset"] = "custom"
-    config["ratio"] = 1
+    config["ratio"] = mask_ratio
     config["category"] = category_name
     config["name"] = f"{category_name}_{config['setup_name']}"
 
@@ -1022,6 +1026,7 @@ def main_custom(
     log.info("  Supervision:     %s", supervision.value)
     log.info("  Good-test split:   %.0f%%", good_test_split * 100)
     log.info("  Defect-train split:%.0f%%", defect_train_split * 100)
+    log.info("  Mask ratio:        %.2f", mask_ratio)
     log.info("  AMP:               %s", config.get("use_amp", False))
 
     seed_everything(config["seed"], workers=True)
@@ -1040,6 +1045,7 @@ def main_custom(
         seed=config["seed"],
         good_test_split=good_test_split,
         defect_train_split=defect_train_split,
+        mask_ratio=mask_ratio,
         flips=config.get("flips", False),
     )
     datamodule.setup()
@@ -1047,8 +1053,11 @@ def main_custom(
     results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device)
 
     results_writer.add_result(category=category_name, last=results)
+    # include run_name so concurrent runs sharing a results dir (e.g. one per
+    # supervision level) don't overwrite each other's aggregated csv
+    agg_subdir = config.get("run_name") or config["dataset"]
     results_writer.save(
-        Path(config["results_save_path"]) / "aggregated" / config["dataset"]
+        Path(config["results_save_path"]) / "aggregated" / _sanitize(agg_subdir)
     )
 
 
@@ -1164,6 +1173,15 @@ def main():
         supervision = _sup_map[sup_str]
         config["supervision_str"] = supervision.value
 
+        mask_ratio = args.ratio if args.ratio is not None else 1.0
+        if not 0.0 <= mask_ratio <= 1.0:
+            print(
+                f"ERROR: --ratio for the custom dataset is a fraction and must be "
+                f"in [0, 1], got {mask_ratio}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
         category_name = args.category or args.data_root.name
         main_custom(
             device=device,
@@ -1173,6 +1191,7 @@ def main():
             defect_train_split=args.defect_train_split,
             category_name=category_name,
             supervision=supervision,
+            mask_ratio=mask_ratio,
         )
 
 

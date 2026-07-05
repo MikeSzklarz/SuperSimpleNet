@@ -10,11 +10,13 @@ fully
 0.2
 --defect-train-split
 0.5
+# Fully supervised: every training defect must have a mask; images without one
+# are skipped for training (--ratio does not apply here).
 --image-size
 256
 256
 --epochs
-2000
+300
 --batch
 32
 --seed

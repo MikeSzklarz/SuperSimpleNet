@@ -27,8 +27,14 @@ Defect images (test/<defect>/)
 Supervision modes
 -----------------
 unsupervised  — defect_train_split must be 0; no anomalous training samples
-weakly/mixed  — defect_train_split > 0; masks used when available
+weakly        — defect_train_split > 0; masks always ignored (image-level labels only)
+mixed         — defect_train_split > 0; masks kept for a mask_ratio fraction of
+                training defects (seeded, per defect type), stripped from the rest
 fully         — defect_train_split > 0; samples without masks are skipped for training
+
+mask_ratio only affects training samples; test masks are always kept for evaluation.
+With a fixed seed the kept-mask subsets are nested (ratio 0.25 ⊂ 0.5 ⊂ 1.0), so
+supervision-ladder runs differ only in how many masks are revealed.
 """
 
 import logging
@@ -65,6 +71,8 @@ class CustomDataset(SSNDataset):
         seed: RNG seed for reproducible splits
         good_test_split: fraction of train/good images withheld for test
         defect_train_split: fraction of test/<defect>/ images used for supervised training
+        mask_ratio: fraction of masked training defects that keep their pixel masks
+            (mixed supervision only; weakly forces 0, fully ignores it)
         flips: augment anomalous training samples with flips
         normal_flips: apply random flips to normal training samples
     """
@@ -78,6 +86,7 @@ class CustomDataset(SSNDataset):
         seed: int = 42,
         good_test_split: float = 0.2,
         defect_train_split: float = 0.0,
+        mask_ratio: float = 1.0,
         flips: bool = False,
         normal_flips: bool = False,
     ) -> None:
@@ -92,6 +101,7 @@ class CustomDataset(SSNDataset):
         self.seed = seed
         self.good_test_split = good_test_split
         self.defect_train_split = defect_train_split
+        self.mask_ratio = mask_ratio
 
     # ------------------------------------------------------------------
     # helpers
@@ -129,6 +139,35 @@ class CustomDataset(SSNDataset):
         train_idx = sorted(idx[:n_train])
         test_idx = sorted(idx[n_train:])
         return [images[i] for i in train_idx], [images[i] for i in test_idx]
+
+    def _effective_mask_ratio(self) -> float:
+        """Resolve mask_ratio against the supervision mode.
+
+        weakly — always 0 (image-level labels only, masks ignored)
+        fully  — always 1 (maskless samples are skipped instead)
+        mixed  — the configured value
+        """
+        if self.supervision == Supervision.WEAKLY_SUPERVISED:
+            return 0.0
+        if self.supervision == Supervision.FULLY_SUPERVISED:
+            return 1.0
+        return self.mask_ratio
+
+    def _strip_masks(self, rows: list[dict], category_idx: int, ratio: float) -> None:
+        """Keep pixel masks for a `ratio` fraction of masked training rows in one
+        defect category; downgrade the rest to image-level labels.
+
+        Seeded per category (independently of ratio), so subsets are nested:
+        the masks kept at ratio 0.25 are also kept at 0.5 and 1.0.
+        """
+        masked_idx = [i for i, r in enumerate(rows) if r["is_segmented"]]
+        n_keep = int(round(len(masked_idx) * ratio))
+        rng = np.random.default_rng(self.seed + category_idx + 1)
+        keep = set(rng.permutation(masked_idx)[:n_keep])
+        for i in masked_idx:
+            if i not in keep:
+                rows[i]["mask_path"] = ""
+                rows[i]["is_segmented"] = False
 
     def _make_row(
         self, img_path: Path, label: int, gt_dir: Path, defect_name: str
@@ -172,13 +211,14 @@ class CustomDataset(SSNDataset):
         defect_summary: dict[str, dict] = {}  # {name: {train: n, test: n}}
 
         require_mask = self.supervision == Supervision.FULLY_SUPERVISED
+        mask_ratio = self._effective_mask_ratio()
 
         for cat_idx, defect_dir in enumerate(defect_dirs):
             defect_name = defect_dir.name
             imgs = self._scan_images(defect_dir)
             d_train_imgs, d_test_imgs = self._split_defect_images(imgs, cat_idx)
 
-            n_train_added = 0
+            cat_train_rows: list[dict] = []
             for img_path in d_train_imgs:
                 row = self._make_row(img_path, 1, gt_dir, defect_name)
                 if require_mask and not row["is_segmented"]:
@@ -187,8 +227,12 @@ class CustomDataset(SSNDataset):
                         defect_name, img_path.name,
                     )
                     continue
-                train_defect_rows.append(row)
-                n_train_added += 1
+                cat_train_rows.append(row)
+
+            if mask_ratio < 1.0:
+                self._strip_masks(cat_train_rows, cat_idx, mask_ratio)
+            train_defect_rows.extend(cat_train_rows)
+            n_train_added = len(cat_train_rows)
 
             for img_path in d_test_imgs:
                 test_defect_rows.append(self._make_row(img_path, 1, gt_dir, defect_name))
@@ -221,6 +265,8 @@ class CustomDataset(SSNDataset):
                         logger.info("    %-30s → %2d train / %2d test",
                                     name, counts["train"], counts["test"])
                 n_masked = sum(1 for r in train_defect_rows if r["is_segmented"])
+                logger.info("  Mask ratio:         %.2f  (requested %.2f)",
+                            mask_ratio, self.mask_ratio)
                 logger.info("  Masks in training anomalies: %d / %d",
                             n_masked, len(train_defect_rows))
 
@@ -285,6 +331,8 @@ class Custom(SSNDataModule):
         seed: RNG seed for reproducible splits
         good_test_split: fraction of train/good images withheld for test
         defect_train_split: fraction of test/<defect>/ images used for training
+        mask_ratio: fraction of masked training defects that keep their pixel masks
+            (mixed supervision only; weakly forces 0, fully ignores it)
         flips: augment anomalous training samples with flips
         normalization: pixel normalization strategy
     """
@@ -300,6 +348,7 @@ class Custom(SSNDataModule):
         seed: int = 42,
         good_test_split: float = 0.2,
         defect_train_split: float = 0.0,
+        mask_ratio: float = 1.0,
         flips: bool = False,
         normalization: str | InputNormalizationMethod = InputNormalizationMethod.IMAGENET,
     ) -> None:
@@ -321,6 +370,7 @@ class Custom(SSNDataModule):
             seed=seed,
             good_test_split=good_test_split,
             defect_train_split=defect_train_split,
+            mask_ratio=mask_ratio,
         )
         self.train_data = CustomDataset(
             **shared_kwargs,

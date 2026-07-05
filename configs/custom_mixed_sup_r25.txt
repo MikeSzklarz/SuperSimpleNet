@@ -1,0 +1,42 @@
+# Mixed supervision — 25% of masked training defects keep their pixel masks;
+# the rest train with image-level labels only. Mask subsets are seeded and
+# nested across the r25/r50/r75 configs (same --seed), so runs differ only in
+# how many masks are revealed. ground_truth/ is never modified.
+--dataset
+custom
+--run-name
+custom-mixed-r25
+--mode
+sup
+--supervision
+mixed
+--ratio
+0.25
+--good-test-split
+0.2
+--defect-train-split
+0.5
+--image-size
+256
+256
+--epochs
+300
+--batch
+32
+--seed
+42
+--perlin-thr
+0.6
+--eval-step-size
+4
+--num-workers
+1
+--flips
+--clip-grad
+--amp
+--no-stop-grad
+--dt
+3
+2
+--dilate
+7

@@ -10,7 +10,7 @@ unsup
 256
 256
 --epochs
-2000
+300
 --batch
 32
 --seed

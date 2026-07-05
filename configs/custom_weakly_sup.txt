@@ -10,11 +10,13 @@ weakly
 0.2
 --defect-train-split
 0.5
+# Weakly supervised: ground_truth/ masks are ignored for training (mask ratio
+# forced to 0); anomalous training images contribute image-level labels only.
 --image-size
 256
 256
 --epochs
-2000
+300
 --batch
 32
 --seed
