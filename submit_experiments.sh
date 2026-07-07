@@ -37,6 +37,11 @@
 #   ./submit_experiments.sh --experiment-name hires-384x512 --image-size 384 512 \
 #       --data-root ../data/BowTie-NONSME-Groundtruth
 #
+# Also override batch size for every job (e.g. to avoid OOM at higher
+# resolutions -- larger --image-size needs more memory per sample):
+#   ./submit_experiments.sh --experiment-name hires-384x512 --image-size 384 512 \
+#       --batch 16 --data-root ../data/BowTie-NONSME-Groundtruth
+#
 # Produces:
 #   results-hires-384x512/
 #       cp1/
@@ -59,6 +64,8 @@
 #   --data-root D [D...]  Required. One or more datasets (see above); may repeat
 #   --image-size H W      Override training resolution for every job (default:
 #                         whatever each config file already sets)
+#   --batch N            Override batch size for every job (default: whatever
+#                         each config file already sets)
 #   --nodes n1,n2        Nodes to round-robin datasets across (default: waccamaw01,waccamaw02)
 #   --configs a,b        Config files to run (default: all configs/custom_*.txt)
 #   --results-root D     Parent dir for results-<experiment-name> (default: .)
@@ -72,13 +79,14 @@ set -euo pipefail
 EXPERIMENT=""
 IMAGE_SIZE_H=""
 IMAGE_SIZE_W=""
+BATCH=""
 NODES="waccamaw01,waccamaw02"
 CONFIGS=""
 RESULTS_ROOT="."
 DRY_RUN=0
 RAW_DATASETS=()
 
-usage() { sed -n '2,68p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,75p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -94,6 +102,7 @@ while [[ $# -gt 0 ]]; do
             done
             ;;
         --image-size)   IMAGE_SIZE_H="$2"; IMAGE_SIZE_W="$3"; shift 3 ;;
+        --batch)        BATCH="$2"; shift 2 ;;
         --nodes)        NODES="$2"; shift 2 ;;
         --configs)      CONFIGS="$2"; shift 2 ;;
         --results-root) RESULTS_ROOT="$2"; shift 2 ;;
@@ -227,6 +236,7 @@ for i in "${!DATASETS[@]}"; do
              --results-dir "$results_dir"
              --run-name "$run_name")
         [[ -n "$IMAGE_SIZE_H" ]] && cmd+=(--image-size "$IMAGE_SIZE_H" "$IMAGE_SIZE_W")
+        [[ -n "$BATCH" ]] && cmd+=(--batch "$BATCH")
         if [[ $DRY_RUN -eq 1 ]]; then
             echo "  [dry-run] ${cmd[*]}"
         else
