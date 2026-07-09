@@ -245,7 +245,10 @@ class CustomDataset(SSNDataset):
         # ── TRAIN split ──────────────────────────────────────────────────
         if self.split == Split.TRAIN:
             normal_rows = [
-                {"image_path": str(p), "mask_path": "", "label_index": 0, "is_segmented": False}
+                # normal images are always segmented (empty mask is trustworthy
+                # ground truth regardless of supervision level; see gamma in
+                # arXiv:2508.19060 sec. 3.4)
+                {"image_path": str(p), "mask_path": "", "label_index": 0, "is_segmented": True}
                 for p in train_good
             ]
 
@@ -291,7 +294,7 @@ class CustomDataset(SSNDataset):
 
         # ── TEST split ───────────────────────────────────────────────────
         test_normal_rows = [
-            {"image_path": str(p), "mask_path": "", "label_index": 0, "is_segmented": False}
+            {"image_path": str(p), "mask_path": "", "label_index": 0, "is_segmented": True}
             for p in test_good
         ]
         n_masked_test = sum(1 for r in test_defect_rows if r["is_segmented"])
