@@ -725,13 +725,24 @@ def test(
 # train + eval wrapper
 # ---------------------------------------------------------------------------
 
-def train_and_eval(model, datamodule, config, device):
-    log = get_logger()
+def _open_experiment(config: dict) -> ExperimentDir:
+    """Create the experiment dir and attach its training.log file handler.
 
+    Must be called as soon as the experiment-defining config fields (dataset,
+    category/run_name, results_save_path) are finalized for a run - i.e.
+    before any dataset/model/datamodule setup logging happens - otherwise
+    that early output only reaches the console (slurm .out) and is missing
+    from training.log.
+    """
     exp = ExperimentDir(Path(config["results_save_path"]), config)
     exp.create_dirs()
     exp.save_config(config)
     exp.add_file_logging()
+    return exp
+
+
+def train_and_eval(model, datamodule, config, device, exp: ExperimentDir):
+    log = get_logger()
 
     log.info("")
     log.info("  Experiment dir: %s", exp.root)
@@ -813,13 +824,14 @@ def main_mvtec(device, config):
     )
 
     for category in categories:
+        config["category"] = category
+        config["name"] = f"{category}_{config['setup_name']}"
+        exp = _open_experiment(config)
+
         log.info("")
         log.info("╔═══════════════════════════════════════════════════════════╗")
         log.info("║  Dataset: MVTec   Category: %-29s ║", category)
         log.info("╚═══════════════════════════════════════════════════════════╝")
-
-        config["category"] = category
-        config["name"] = f"{category}_{config['setup_name']}"
 
         seed_everything(config["seed"], workers=True)
         torch.backends.cudnn.deterministic = True
@@ -838,7 +850,7 @@ def main_mvtec(device, config):
         )
         datamodule.setup()
 
-        results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device)
+        results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device, exp=exp)
 
         results_writer.add_result(category=category, last=results)
         results_writer.save(
@@ -862,13 +874,14 @@ def main_visa(device, config):
     )
 
     for category in categories:
+        config["category"] = category
+        config["name"] = f"{category}_{config['setup_name']}"
+        exp = _open_experiment(config)
+
         log.info("")
         log.info("╔═══════════════════════════════════════════════════════════╗")
         log.info("║  Dataset: VisA    Category: %-29s ║", category)
         log.info("╚═══════════════════════════════════════════════════════════╝")
-
-        config["category"] = category
-        config["name"] = f"{category}_{config['setup_name']}"
 
         seed_everything(config["seed"], workers=True)
         torch.backends.cudnn.deterministic = True
@@ -887,7 +900,7 @@ def main_visa(device, config):
         )
         datamodule.setup()
 
-        results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device)
+        results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device, exp=exp)
 
         results_writer.add_result(category=category, last=results)
         results_writer.save(
@@ -905,6 +918,8 @@ def main_ksdd2(device, config, supervision):
     results_writer = ResultsWriter(
         metrics=["AP-det", "AP-loc", "P-AUROC", "I-MaxF1", "I-AUROC", "AUPRO", "seg-AP-det", "seg-I-AUROC", "seg-I-MaxF1", "ratio"]
     )
+
+    exp = _open_experiment(config)
 
     log.info("")
     log.info("╔═══════════════════════════════════════════════════════════╗")
@@ -932,7 +947,7 @@ def main_ksdd2(device, config, supervision):
     )
     datamodule.setup()
 
-    results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device)
+    results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device, exp=exp)
 
     results["ratio"] = config["ratio"]
     results_writer.add_result(category="ksdd2", last=results)
@@ -961,10 +976,12 @@ def main_sensum(device, config, supervision):
         torch.backends.cudnn.benchmark = False
 
         for fold_num in range(3):
-            log.info("  ─── Fold %d / 3 ────────────────────────────────────────", fold_num + 1)
             config["category"] = f"{category.value}_{fold_num}"
             config["name"] = f"{category.value}_{config['setup_name']}_{fold_num}"
             config["fold"] = fold_num
+            exp = _open_experiment(config)
+
+            log.info("  ─── Fold %d / 3 ────────────────────────────────────────", fold_num + 1)
 
             model = SuperSimpleNet(
                 image_size=sensum.get_default_resolution(category), config=config
@@ -987,7 +1004,7 @@ def main_sensum(device, config, supervision):
             )
             datamodule.setup()
 
-            results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device)
+            results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device, exp=exp)
 
             results["fold"] = fold_num
             results["ratio"] = config["ratio"]
@@ -1017,6 +1034,8 @@ def main_custom(
     results_writer = ResultsWriter(
         metrics=["AP-det", "AP-loc", "P-AUROC", "I-MaxF1", "I-AUROC", "AUPRO", "seg-AP-det", "seg-I-AUROC", "seg-I-MaxF1"]
     )
+
+    exp = _open_experiment(config)
 
     log.info("")
     log.info("╔═══════════════════════════════════════════════════════════╗")
@@ -1050,7 +1069,7 @@ def main_custom(
     )
     datamodule.setup()
 
-    results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device)
+    results = train_and_eval(model=model, datamodule=datamodule, config=config, device=device, exp=exp)
 
     results_writer.add_result(category=category_name, last=results)
     # include run_name so concurrent runs sharing a results dir (e.g. one per

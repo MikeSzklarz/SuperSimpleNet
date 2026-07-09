@@ -69,8 +69,17 @@ class ExperimentDir:
             json.dump(_make_serializable(config), f, indent=2)
 
     def add_file_logging(self) -> None:
-        """Attach a file handler to the 'ssn' logger, writing to logs/training.log."""
+        """Attach a file handler to the 'ssn' logger, writing to logs/training.log.
+
+        Removes any previously attached FileHandler first so that log output
+        from earlier experiments (e.g. prior categories/folds in the same
+        process) doesn't keep accumulating across every subsequent training.log.
+        """
         logger = logging.getLogger("ssn")
+        for h in list(logger.handlers):
+            if isinstance(h, logging.FileHandler):
+                logger.removeHandler(h)
+                h.close()
         fh = logging.FileHandler(self.logs / "training.log", mode="w")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
