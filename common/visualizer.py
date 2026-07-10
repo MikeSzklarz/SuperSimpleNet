@@ -24,6 +24,13 @@ _GT_COLOR = (0.878, 0.129, 0.541)   # magenta  #e0218a
 _PRED_COLOR = (0.0, 0.761, 1.0)     # cyan     #00c2ff
 
 _TURBO = plt.get_cmap("turbo")
+_TITLE_FONTSIZE = 11
+_SUPTITLE_FONTSIZE = 13
+# Fixed inches reserved above the images for the stacked suptitle + column
+# titles. Kept as an absolute size (not a fraction of figure height) so it
+# stays legible even for very wide/short images, where a fraction-of-height
+# margin would shrink to almost nothing.
+_TITLE_AREA_IN = (_SUPTITLE_FONTSIZE + _TITLE_FONTSIZE) * 1.3 / 72 + 0.15
 
 
 def _overlay_mask(image: np.ndarray, mask: np.ndarray, color: tuple, fill_alpha: float = 0.35, outline_px: int = 2) -> np.ndarray:
@@ -99,35 +106,58 @@ class Visualizer:
 
             pred_mask = anomaly_map >= 0.5
 
-            fig_h = h / 256 * 2
-            fig_w = w / 256 * 9.6
+            n_cols = 4
+            titles = ["Image", f"Ground truth: {gt_label_str}", "Anomaly map", "Predicted mask"]
 
-            fig, plots = plt.subplots(1, 4, figsize=(fig_w, fig_h))
+            image_h = h / 256 * 2
+            # Each subplot cell must have the same width:height ratio as the
+            # image itself, otherwise imshow (which preserves aspect ratio)
+            # letterboxes the image inside its cell and leaves whitespace
+            # between columns even with wspace=0.
+            panel_w = image_h * (w / h)
+
+            # With zero column padding, small images can produce panels too
+            # narrow for their titles, causing adjacent titles to overlap.
+            # Scale the whole figure up (preserving per-panel aspect ratio,
+            # so columns stay gap-free) so the longest title always fits.
+            min_panel_w = max(len(t) for t in titles) * _TITLE_FONTSIZE * 0.6 / 72
+            scale = max(1.0, min_panel_w / panel_w)
+            image_h *= scale
+            panel_w *= scale
+
+            fig_w = n_cols * panel_w
+            # The title area is added on top of (not carved out of) the image
+            # height, so it stays a fixed absolute size regardless of aspect
+            # ratio instead of shrinking away for wide/short images.
+            fig_h = image_h + _TITLE_AREA_IN
+            top = image_h / fig_h
+
+            fig, plots = plt.subplots(1, n_cols, figsize=(fig_w, fig_h))
             for s_plt in plots:
                 s_plt.axis("off")
 
-            gap_frac = 5 / (fig_w * fig.dpi / 4)
-            fig.subplots_adjust(left=0, right=1, bottom=0, top=0.78, wspace=gap_frac)
+            fig.subplots_adjust(left=0, right=1, bottom=0, top=top, wspace=0)
 
             plots[0].imshow(image)
-            plots[0].title.set_text("Image")
+            plots[0].set_title(titles[0], fontsize=_TITLE_FONTSIZE)
 
             if gt_mask is not None and gt_mask.any():
                 plots[1].imshow(_overlay_mask(image, gt_mask, _GT_COLOR))
             else:
                 plots[1].imshow(image)
-            plots[1].title.set_text(f"Ground truth: {gt_label_str}")
+            plots[1].set_title(titles[1], fontsize=_TITLE_FONTSIZE)
 
             plots[2].imshow(_overlay_heatmap(image, anomaly_map))
-            plots[2].title.set_text("Anomaly map")
+            plots[2].set_title(titles[2], fontsize=_TITLE_FONTSIZE)
 
             plots[3].imshow(_overlay_mask(image, pred_mask, _PRED_COLOR))
-            plots[3].title.set_text("Predicted mask")
+            plots[3].set_title(titles[3], fontsize=_TITLE_FONTSIZE)
 
             fig.suptitle(
                 f"{Path(image_path).name}   —   GT: {gt_label_str}   "
                 f"Score: {round(score.item(), 4)}   SScore: {round(seg_score.item(), 4)}",
                 y=0.98,
+                fontsize=_SUPTITLE_FONTSIZE,
             )
 
             defect_type = Path(image_path).parent.name
