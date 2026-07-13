@@ -139,7 +139,58 @@ resolutions (320×192, 144×144) work with patch-16 backbones only.
   ViT run needs only the matching `--backbone`/`--image-size`/`--feat-scale` at load
   time; see the architecture block in `eval.py`'s config).
 
-## 5. How to run the comparison
+## 5. Literature evidence: why this should (and might not) work
+
+**For — the same recipe is published and works:**
+
+- **[GeneralAD (ECCV 2024)](https://arxiv.org/abs/2407.12427)** is nearly this exact
+  experiment: frozen **DINOv2 last-layer patch features** (518² input, LayerNorm-ed,
+  CLS dropped) perturbed with **Gaussian noise** to create pseudo-anomalies for a
+  discriminator. Result: **99.2% I-AUROC on MVTec-AD and 96.0% on VisA** — on par with
+  CNN-based SimpleNet on MVTec (99.6%) and **+8.1 points over it on VisA** (87.9%).
+  Their ablation found noise on a *random subset of patches* best for industrial data —
+  which is functionally what SuperSimpleNet's Perlin-masked regional noise already does.
+- **Noise scale confirms the retuning expectation**: GeneralAD's optimal noise was
+  **σ = 0.25** on DINOv2 features vs SuperSimpleNet's 0.015 tuned for WRN50 — an
+  order-of-magnitude difference, so expect the `--noise-std` sweep to matter.
+- **DINOv2 features separate defects exceptionally well even with no training**:
+  [AnomalyDINO (WACV 2025)](https://arxiv.org/abs/2405.14529) reports DINOv2 features
+  give **≥ +4% AUROC over classification-pretrained ViT features** on MVTec-AD/VisA,
+  and one-shot detection at 96.6% AUROC from raw patch-feature similarity alone.
+- **Supervised mode should benefit most**: frozen DINOv2 + a small trainable
+  segmentation head has been shown to beat fully-supervised CNNs with only
+  **6–24 labeled defect images** in industrial settings
+  ([injection-molding defect study, IJAMT 2026](https://link.springer.com/article/10.1007/s00170-026-17386-1)) —
+  directly relevant to SuperSimpleNet's weakly/mixed-supervised regimes.
+- **AnomalyVFM itself** (CVPR 2026) demonstrates a frozen VFM + tiny trainable head
+  trained only on synthetic anomalies transfers zero-shot to real datasets.
+
+**Against / caveats the literature also supports:**
+
+- **A naive backbone swap can regress on MVTec**: GeneralAD reports SimpleNet at
+  99.6% (WRN50) → **93.3% with a supervised ViT-B/16** → ~97.7% with DINOv2-B.
+  MVTec's texture-centric defects favor CNN low-level features; the ViT payoff shows
+  up on VisA/LOCO-style structured data, not necessarily on MVTec.
+- **GeneralAD used an attention-based discriminator** (4-head MHA + MLP), not
+  SimpleNet's pointwise scoring. SuperSimpleNet's seg head is 1×1 convs (pointwise) —
+  the AvgPool neighborhood aggregation and 5×5 cls-head conv add some spatial context,
+  but this is a structural difference that could cost accuracy on ViT features.
+- **Middle layers beat the last layer for reconstruction-based AD**:
+  [Dinomaly (CVPR 2025)](https://arxiv.org/abs/2405.14325) deliberately uses ViT
+  layers 3–10 and avoids the final block. GeneralAD's success with the last layer
+  shows discriminative methods differ, but `--vit-layers` is the first knob to try
+  if last-block results disappoint.
+- **Registers matter for dense maps**:
+  [Vision Transformers Need Registers (ICLR 2024)](https://arxiv.org/abs/2309.16588)
+  documents high-norm artifact tokens in DINOv2 that corrupt dense feature maps —
+  use the `_reg` variants (the default here) for anomaly localization.
+
+Net read: the mechanism (Gaussian-noise pseudo-anomalies on frozen foundation-model
+patch features + discriminator) is validated at high resolution with regional noise;
+the open questions are per-dataset (MVTec may not improve) and structural (pointwise
+seg head, layer choice, noise scale).
+
+## 6. How to run the comparison
 
 ```bash
 # baseline
@@ -155,7 +206,7 @@ python tests/smoke_test_backbones.py dinov2_vitl14_reg
 Compare I-AUROC / AP-det (detection) and P-AUROC / AUPRO / AP-loc (localization) from
 the per-category CSVs in the results directory.
 
-## 6. Future work
+## 7. Future work
 
 - **LoRA/DoRA fine-tuning (phase 2)**: port AnomalyVFM's pure-torch `peft_local/`
   package, gate the extractor's `no_grad()` on PEFT being enabled, add a fourth
