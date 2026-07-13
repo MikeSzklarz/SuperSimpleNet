@@ -126,6 +126,37 @@ Config for the model and datasets is contained within train.py file. If you want
 
 We recommend taking the MVTec parameters when training on your own **unsupervised** dataset and SenumSODF parameters for **supervised** dataset.
 
+## ViT / foundation-model backbones
+
+In addition to torchvision CNNs, the feature extractor supports frozen vision
+foundation models (adapted from [AnomalyVFM](https://github.com/vicoslab/AnomalyVFM)),
+selected purely by the `--backbone` name:
+
+```bash
+python train.py --dataset mvtec --backbone dinov2_vitl14_reg --image-size 448 448 --feat-scale 2 --batch 16 --amp
+# or use the provided configs:
+python train.py --config configs/mvtec_dinov2.txt
+python train.py --config configs/custom_unsup_dinov2.txt --data-root /path/to/data
+```
+
+| Backbone | Patch | Recommended `--image-size` | Extra requirements |
+|---|---|---|---|
+| `dinov2_vitl14_reg` (also `_vitb14_reg`, `_vits14`, …) | 14 | 448 448 (or 252/518) | none (torch.hub download) |
+| `dinov3_vitl16` | 16 | 512 512 | local [dinov3 repo](https://github.com/facebookresearch/dinov3) clone + gated weights: `--dinov3-path`, `--dinov3-weights` |
+| `radio_v2.5-l` | 16 | 512 512 | `pip install timm` |
+| `clip_vitl14_336` | 14 | 448 448 | `pip install transformers` |
+| `siglip2_so400m` | 16 | 512 512 | `pip install transformers` |
+| `tipsv2_l14` | 14 | 448 448 | `pip install transformers` (uses `trust_remote_code`) |
+
+Notes:
+- The image size must be divisible by the backbone's patch size (14 or 16) — training fails fast with a suggestion otherwise. KSDD2's fixed native resolution (640x232) is incompatible with ViT backbones; Sensum works with patch-16 backbones only.
+- The backbone is always **frozen** (same as the CNN path); only the adaptor and the seg/cls heads train, and backbone weights are excluded from checkpoints.
+- `--feat-scale 2` doubles the feature-grid resolution (e.g. 32x32 → 64x64 at 448², matching the CNN path's working grid) at ~4x head memory; `--vit-layers` selects intermediate ViT blocks (dinov2/dinov3 only, e.g. `--vit-layers 17 23` for ViT-L multi-layer features).
+- Default anomaly-generation hyperparameters (`--noise-std`, `--perlin-thr`) were tuned for the CNN feature space and may need retuning for ViT features.
+- Smoke test any backbone without a dataset: `python tests/smoke_test_backbones.py dinov2_vitl14_reg`.
+
+See `VIT_BACKBONE_INTEGRATION.md` for the full design, architecture comparison with AnomalyVFM, and expectation setting.
+
 ## Performance benchmark
 
 Use the code inside `./perf` to evaluate performance metrics (inference speed, throughput, memory consumption, flops):

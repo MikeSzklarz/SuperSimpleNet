@@ -383,6 +383,15 @@ def run_eval(datasets, ratios, run_id, res_path):
         # "ratio": "1", # configured below in the loop if using extended version
         "adapt_cls_feat": False,  # (JIMS extension) cls features are not adapted
         # "adapt_cls_feat": True,
+        # architecture — must match the values used at training time, otherwise
+        # the checkpoint silently fails to load (strict=False)
+        "backbone": "wide_resnet50_2",  # or e.g. "dinov2_vitl14_reg"
+        "layers": ["layer2", "layer3"],  # CNN backbones only
+        "patch_size": 3,
+        "vit_layers": None,  # ViT backbones: block indices (None = last block)
+        "feat_scale": 1,  # ViT backbones: feature-grid upscale factor (1 or 2)
+        "dinov3_path": None,
+        "dinov3_weights": None,
     }
     data_functions = {
         "sensum": get_sensum,

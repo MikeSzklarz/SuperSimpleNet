@@ -12,7 +12,7 @@ from torch.optim.lr_scheduler import MultiStepLR, LRScheduler
 from torchvision.transforms import GaussianBlur
 
 from common.perlin_noise import rand_perlin_2d
-from .feature_extractor import FeatureExtractor
+from .feature_extractor import build_feature_extractor
 
 _log = logging.getLogger("ssn")
 
@@ -30,12 +30,7 @@ class SuperSimpleNet(nn.Module):
         super().__init__()
         self.image_size = image_size
         self.config = config
-        self.feature_extractor = FeatureExtractor(
-            backbone=config.get("backbone", "wide_resnet50_2"),
-            layers=config.get("layers", ["layer2", "layer3"]),
-            patch_size=config.get("patch_size", 3),
-            image_size=image_size,
-        )
+        self.feature_extractor = build_feature_extractor(config, image_size)
         # feature channels, height and width
         fc, fh, fw = self.feature_extractor.feature_dim
         self.fh = fh
@@ -73,9 +68,18 @@ class SuperSimpleNet(nn.Module):
         dec_n = sum(p.numel() for p in dec_params)
         total = adaptor_params + seg_n + dec_n
 
+        from .vit_feature_extractor import is_vit_backbone
+
+        backbone = self.config.get("backbone", "wide_resnet50_2")
         _log.info("─── Model: SuperSimpleNet ───────────────────────────────────")
-        _log.info("  Backbone:         %s  (ImageNet pretrained, frozen)", self.config.get("backbone", "wide_resnet50_2"))
-        _log.info("  Feature layers:   %s", self.config.get("layers", ["layer2", "layer3"]))
+        if is_vit_backbone(backbone):
+            _log.info("  Backbone:         %s  (foundation model, frozen)", backbone)
+            _log.info("  Feature layers:   %s  (feat_scale=%d)",
+                      self.config.get("vit_layers") or "last block",
+                      self.config.get("feat_scale", 1))
+        else:
+            _log.info("  Backbone:         %s  (ImageNet pretrained, frozen)", backbone)
+            _log.info("  Feature layers:   %s", self.config.get("layers", ["layer2", "layer3"]))
         _log.info("  Patch size:       %d  (avg-pool kernel)", self.config.get("patch_size", 3))
         _log.info("  Feature map:      %d x %d  (channels=%d) at %dx%d input", fh, fw, fc, self.image_size[0], self.image_size[1])
         _log.info("")

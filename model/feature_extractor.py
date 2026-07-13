@@ -67,3 +67,31 @@ class FeatureExtractor(nn.Module):
         channels = sum(feature.shape[1] for feature in features.values())
         _, _, h, w = next(iter(features.values())).shape
         return channels, h * 2, w * 2
+
+
+def build_feature_extractor(config: dict, image_size: tuple[int, int]) -> nn.Module:
+    """Build the CNN or ViT feature extractor based on the backbone name.
+
+    ViT / foundation-model backbones (dinov2*, dinov3*, radio*, clip*, siglip2*,
+    tipsv2*) are dispatched by name prefix; anything else is treated as a
+    torchvision CNN, keeping all existing configs working unchanged.
+    """
+    from .vit_feature_extractor import ViTFeatureExtractor, is_vit_backbone
+
+    backbone = config.get("backbone", "wide_resnet50_2")
+    if is_vit_backbone(backbone):
+        return ViTFeatureExtractor(
+            backbone=backbone,
+            layers=config.get("vit_layers"),
+            patch_size=config.get("patch_size", 3),
+            image_size=image_size,
+            feat_scale=config.get("feat_scale", 1),
+            dinov3_path=config.get("dinov3_path"),
+            dinov3_weights=config.get("dinov3_weights"),
+        )
+    return FeatureExtractor(
+        backbone=backbone,
+        layers=config.get("layers", ["layer2", "layer3"]),
+        patch_size=config.get("patch_size", 3),
+        image_size=image_size,
+    )

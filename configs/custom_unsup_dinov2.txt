@@ -1,0 +1,32 @@
+# Unsupervised training on a custom dataset with a frozen DINOv2 ViT-L/14
+# backbone. Same setup as custom_unsup.txt, but image size must be divisible
+# by the ViT patch size (14): 448x448 -> 32x32 patch grid, --feat-scale 2 ->
+# 64x64 working grid (matches the CNN path at 256x256).
+--dataset
+custom
+--run-name
+custom-unsupervised-dinov2
+--mode
+unsup
+--good-test-split
+0.2
+--backbone
+dinov2_vitl14_reg
+--image-size
+448
+448
+--feat-scale
+2
+--epochs
+300
+--batch
+16
+--seed
+42
+--perlin-thr
+0.6
+--eval-step-size
+4
+--num-workers
+4
+--amp

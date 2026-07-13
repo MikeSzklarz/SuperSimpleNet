@@ -31,6 +31,7 @@ from datamodules.visa import Visa
 from datamodules.custom import Custom
 
 from model.supersimplenet import SuperSimpleNet
+from model.vit_feature_extractor import is_vit_backbone, expected_patch_size
 
 from common.visualizer import Visualizer
 from common.results_writer import ResultsWriter
@@ -195,15 +196,54 @@ def parse_args() -> argparse.Namespace:
 
     # ---- model architecture ----
     arch = parser.add_argument_group("Architecture")
-    arch.add_argument("--backbone", default="wide_resnet50_2", help="Torchvision backbone name")
+    arch.add_argument(
+        "--backbone",
+        default="wide_resnet50_2",
+        help=(
+            "Torchvision CNN name (e.g. wide_resnet50_2) or a ViT foundation model: "
+            "dinov2_vitl14_reg / dinov2_vitb14_reg / dinov2_vits14_reg, dinov3_vitl16, "
+            "radio_v2.5-l, clip_vitl14_336, siglip2_so400m, tipsv2_l14. "
+            "ViT backbones require --image-size divisible by their patch size "
+            "(14: e.g. 252/448/518, 16: e.g. 256/512)."
+        ),
+    )
     arch.add_argument(
         "--layers",
         nargs="+",
         default=["layer2", "layer3"],
         metavar="LAYER",
-        help="Backbone layers to extract features from",
+        help="CNN backbone layers to extract features from (ignored for ViT backbones)",
     )
     arch.add_argument("--patch-size", type=int, default=3, help="Avg-pool kernel for neighbourhood aggregation")
+    arch.add_argument(
+        "--vit-layers",
+        type=int,
+        nargs="+",
+        default=None,
+        metavar="BLOCK",
+        help="ViT block indices to extract features from (dinov2/dinov3 only; "
+             "default: last block; e.g. --vit-layers 17 23 for ViT-L multi-layer)",
+    )
+    arch.add_argument(
+        "--feat-scale",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="Bilinear upscale factor for the ViT feature grid (2 matches the CNN "
+             "path's working resolution at 448/512 input; ViT backbones only)",
+    )
+    arch.add_argument(
+        "--dinov3-path",
+        default=None,
+        metavar="PATH",
+        help="Local clone of the dinov3 repo (required for dinov3 backbones; weights are gated)",
+    )
+    arch.add_argument(
+        "--dinov3-weights",
+        default=None,
+        metavar="PATH",
+        help="Path to the downloaded dinov3 checkpoint (.pth)",
+    )
 
     # ---- training schedule ----
     tr = parser.add_argument_group("Training")
@@ -299,6 +339,10 @@ def _build_config(args: argparse.Namespace) -> dict:
         "backbone": args.backbone,
         "layers": args.layers,
         "patch_size": args.patch_size,
+        "vit_layers": args.vit_layers,
+        "feat_scale": args.feat_scale,
+        "dinov3_path": args.dinov3_path,
+        "dinov3_weights": args.dinov3_weights,
         "noise": args.noise,
         "perlin": args.perlin,
         "no_anomaly": args.no_anomaly,
@@ -1115,6 +1159,20 @@ def main():
                     f"WARNING: --data-root is missing expected subfolder '{expected}/': {args.data_root}",
                     file=sys.stderr,
                 )
+
+    if is_vit_backbone(args.backbone) and args.dataset in ("mvtec", "visa", "custom"):
+        p = expected_patch_size(args.backbone)
+        if any(s % p for s in args.image_size):
+            suggested = " ".join(str(round(s / p) * p) for s in args.image_size)
+            print(
+                f"ERROR: --image-size {args.image_size[0]} {args.image_size[1]} is not "
+                f"divisible by the patch size ({p}) of backbone '{args.backbone}'.\n"
+                f"  Use multiples of {p}, e.g.:\n"
+                f"    --image-size {suggested}\n"
+                f"  (recommended: 448 448 for patch-14, 512 512 for patch-16 backbones)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     config = _build_config(args)
     config["dataset"] = args.dataset

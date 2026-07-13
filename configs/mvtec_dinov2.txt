@@ -1,0 +1,20 @@
+# MVTec with a frozen DINOv2 ViT-L/14 backbone instead of the default CNN.
+# 448x448 gives a 32x32 patch grid (with --feat-scale 2 -> 64x64 working grid,
+# matching the CNN path). Batch reduced since ViT-L @ 448 is heavier than
+# WRN50 @ 256.
+--dataset
+mvtec
+--backbone
+dinov2_vitl14_reg
+--image-size
+448
+448
+--feat-scale
+2
+--batch
+16
+--epochs
+300
+--eval-step-size
+4
+--amp
