@@ -4,6 +4,7 @@ anomalib==0.7
 
 # optional
 #wandb
+# for ViT / foundation-model backbones see requirements-vit.txt
 
 --extra-index-url https://download.pytorch.org/whl/cu118
 torch==2.1.0+cu118

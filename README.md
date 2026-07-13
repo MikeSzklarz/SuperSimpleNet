@@ -146,9 +146,10 @@ python train.py --config configs/custom_unsup_dinov2.txt --data-root /path/to/da
 | `radio_v2.5-l` | 16 | 512 512 | `pip install timm` |
 | `clip_vitl14_336` | 14 | 448 448 | `pip install transformers` |
 | `siglip2_so400m` | 16 | 512 512 | `pip install transformers` |
-| `tipsv2_l14` | 14 | 448 448 | `pip install transformers` (uses `trust_remote_code`) |
+| `tipsv2_l14` | 14 | 448 448 | `pip install transformers sentencepiece` (uses `trust_remote_code`) |
 
 Notes:
+- Optional dependencies for all ViT backbones at once: `pip install -r requirements-vit.txt`.
 - The image size must be divisible by the backbone's patch size (14 or 16) — training fails fast with a suggestion otherwise. KSDD2's fixed native resolution (640x232) is incompatible with ViT backbones; Sensum works with patch-16 backbones only.
 - The backbone is always **frozen** (same as the CNN path); only the adaptor and the seg/cls heads train, and backbone weights are excluded from checkpoints.
 - `--feat-scale 2` doubles the feature-grid resolution (e.g. 32x32 → 64x64 at 448², matching the CNN path's working grid) at ~4x head memory; `--vit-layers` selects intermediate ViT blocks (dinov2/dinov3 only, e.g. `--vit-layers 17 23` for ViT-L multi-layer features).

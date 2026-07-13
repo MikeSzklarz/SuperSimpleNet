@@ -1,0 +1,17 @@
+# Optional dependencies for the ViT / foundation-model backbones
+# (see VIT_BACKBONE_INTEGRATION.md and the README "ViT / foundation-model
+# backbones" section). The base requirements.txt is unchanged — install these
+# on top only if you use the corresponding backbones:
+#
+#   dinov2_*  : no extra packages (torch.hub download)
+#   dinov3_*  : no extra packages, but requires a local clone of
+#               https://github.com/facebookresearch/dinov3 and gated weights
+#               from Meta (--dinov3-path / --dinov3-weights)
+#   radio_*   : timm
+#   clip_* / siglip2_* : transformers
+#   tipsv2_*  : transformers + sentencepiece (needed by its remote code)
+
+timm>=1.0
+# version tested by AnomalyVFM; siglip2-naflex needs >=4.53
+transformers==4.56.1
+sentencepiece
