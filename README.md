@@ -143,7 +143,7 @@ python train.py --config configs/custom_unsup_dinov2.txt --data-root /path/to/da
 |---|---|---|---|
 | `dinov2_vitl14_reg` (also `_vitb14_reg`, `_vits14`, …) | 14 | 448 448 (or 252/518) | none (torch.hub download) |
 | `dinov3_vitl16` | 16 | 512 512 | local [dinov3 repo](https://github.com/facebookresearch/dinov3) clone + gated weights: `--dinov3-path`, `--dinov3-weights` |
-| `radio_v2.5-l` | 16 | 512 512 | `pip install timm` |
+| `radio_v2.5-l` | 16 | 512 512 | `pip install timm einops` |
 | `clip_vitl14_336` | 14 | 448 448 | `pip install transformers` |
 | `siglip2_so400m` | 16 | 512 512 | `pip install transformers` |
 | `tipsv2_l14` | 14 | 448 448 | `pip install transformers sentencepiece` (uses `trust_remote_code`) |
