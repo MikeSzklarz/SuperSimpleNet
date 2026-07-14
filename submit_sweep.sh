@@ -54,8 +54,12 @@
 #   --results-root D       Parent dir for results-<experiment-name> (default: .)
 #   --dry-run              Print the sbatch commands without submitting
 #
-# Every dataset is pinned to one node (all its jobs run there); datasets are
-# distributed round-robin over --nodes, same as submit_experiments.sh.
+# Every individual job (each dataset x size x supervision combination) is
+# round-robined over --nodes -- unlike submit_experiments.sh, which pins a
+# whole dataset's jobs to one node. A resolution sweep is commonly run
+# against a single dataset, so pinning per-dataset would leave every node but
+# the first completely idle; round-robining per job spreads the sweep across
+# all nodes given, single dataset or many.
 
 set -euo pipefail
 
@@ -256,9 +260,8 @@ for i in "${!DATASETS[@]}"; do
     fi
     [[ -d "$data_root" ]] || { echo "ERROR: data root not found: $data_root" >&2; exit 1; }
 
-    node="${NODE_LIST[$(( i % ${#NODE_LIST[@]} ))]}"
     results_dir="$RESULTS_BASE/$ds_name"
-    echo "── $ds_name  ($data_root)  →  node $node"
+    echo "── $ds_name  ($data_root)"
 
     for size in "${SIZES[@]}"; do
         h="${size%x*}"
@@ -266,6 +269,11 @@ for i in "${!DATASETS[@]}"; do
         batch="${BATCH_OVERRIDES[$size]:-${BATCH_TABLE[$size]:-}}"
 
         for cfg in "${CONFIG_FILES[@]}"; do
+            # Round-robin every individual job (dataset x size x supervision)
+            # over --nodes, not just once per dataset -- a resolution sweep is
+            # commonly run against a single dataset, and pinning per-dataset
+            # would leave every node but the first idle in that case.
+            node="${NODE_LIST[$(( n_jobs % ${#NODE_LIST[@]} ))]}"
             sup="$(sup_name "$cfg")"
             run_name="${sup}_${h}x${w}"
             job_name="${EXPERIMENT}_${ds_name}_${run_name}"
@@ -278,10 +286,10 @@ for i in "${!DATASETS[@]}"; do
                  --image-size "$h" "$w"
                  --batch "$batch")
             if [[ $DRY_RUN -eq 1 ]]; then
-                echo "  [dry-run] ${cmd[*]}"
+                echo "  [dry-run] (node $node) ${cmd[*]}"
             else
                 out="$("${cmd[@]}")"
-                echo "  $run_name: $out"
+                echo "  $run_name (node $node): $out"
             fi
             n_jobs=$((n_jobs + 1))
         done
