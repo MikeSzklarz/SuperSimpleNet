@@ -7,11 +7,23 @@ anomalib==0.7
 
 # ViT / foundation-model backbones (dinov2/dinov3 need none of these extra
 # packages, just a torch.hub / local-repo download):
-#   radio_*             : timm, einops
-#   clip_* / tipsv2_*   : transformers (+ sentencepiece for tipsv2, which
-#                         loads its architecture via trust_remote_code)
-#   siglip2_*           : NOT supported on this pin. SigLIP2-NaFlex requires
-#                         transformers>=4.53, which in turn requires a public
+#   clip_* / radio_* / tipsv2_*  : need `pip install --upgrade timm` as a
+#                         SEPARATE step after this file. anomalib==0.7 hard-
+#                         pins timm<=0.6.12, which this file leaves in place
+#                         so `pip install -r requirements.txt` resolves
+#                         cleanly on its own — but transformers' AutoModel
+#                         machinery (used by clip_*/tipsv2_*) eagerly imports
+#                         its timm_wrapper integration, which needs
+#                         timm.data.ImageNetInfo (added ~0.9+), and
+#                         NVlabs/RADIO's torch.hub code needs timm.layers
+#                         (also ~0.9+) — both break under anomalib's old
+#                         pinned timm. Upgrading timm afterward is safe here:
+#                         this repo only imports anomalib.data.* /
+#                         anomalib.utils.metrics, never anomalib's own
+#                         (timm-based) model zoo.
+#   siglip2_*           : NOT supported on this pin, timm upgrade alone isn't
+#                         enough. SigLIP2-NaFlex requires transformers>=4.53,
+#                         which in turn requires a public
 #                         torch.utils._pytree.register_pytree_node that
 #                         doesn't exist until a newer torch than 2.1.0 below
 #                         — installing transformers>=4.53 here breaks
@@ -23,7 +35,6 @@ anomalib==0.7
 #                         (b) support CLIP's interpolate_pos_encoding=True.
 #                         Using SigLIP2 requires a separate environment with
 #                         a newer torch (see VIT_BACKBONE_INTEGRATION.md).
-timm>=1.0
 einops
 transformers==4.49.0
 sentencepiece
