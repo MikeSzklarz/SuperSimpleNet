@@ -4,7 +4,29 @@ anomalib==0.7
 
 # optional
 #wandb
-# for ViT / foundation-model backbones see requirements-vit.txt
+
+# ViT / foundation-model backbones (dinov2/dinov3 need none of these extra
+# packages, just a torch.hub / local-repo download):
+#   radio_*             : timm, einops
+#   clip_* / tipsv2_*   : transformers (+ sentencepiece for tipsv2, which
+#                         loads its architecture via trust_remote_code)
+#   siglip2_*           : NOT supported on this pin. SigLIP2-NaFlex requires
+#                         transformers>=4.53, which in turn requires a public
+#                         torch.utils._pytree.register_pytree_node that
+#                         doesn't exist until a newer torch than 2.1.0 below
+#                         — installing transformers>=4.53 here breaks
+#                         everything (even the default ResNet backbone),
+#                         because torch.onnx's own internals eagerly
+#                         `import transformers` as soon as it's installed.
+#                         transformers==4.49.0 is the newest version verified
+#                         to (a) still import cleanly under torch 2.1.0 and
+#                         (b) support CLIP's interpolate_pos_encoding=True.
+#                         Using SigLIP2 requires a separate environment with
+#                         a newer torch (see VIT_BACKBONE_INTEGRATION.md).
+timm>=1.0
+einops
+transformers==4.49.0
+sentencepiece
 
 --extra-index-url https://download.pytorch.org/whl/cu118
 torch==2.1.0+cu118
