@@ -343,12 +343,20 @@ class AnomalyGenerator(nn.Module):
 
         self.config = config
 
-        self.perlin_height = self.next_power_2(self.height)
-        self.perlin_width = self.next_power_2(self.width)
+        # rand_perlin_2d needs canvas dims exactly divisible by the grid
+        # resolution (res), and res is a power of two up to 2**(max_perlin_scale-1).
+        # Pad each axis independently to a multiple of that largest possible res,
+        # rather than to a shared next-power-of-2 — padding both axes to the same
+        # power of two forces a non-square feature map into a square canvas, which
+        # then has to be squished back down anisotropically (see generate_perlin),
+        # warping every synthetic anomaly shape whenever height != width.
+        max_res = 2 ** (self.max_perlin_scale - 1)
+        self.perlin_height = self._pad_to_multiple(self.height, max_res)
+        self.perlin_width = self._pad_to_multiple(self.width, max_res)
 
     @staticmethod
-    def next_power_2(num):
-        return 1 << (num - 1).bit_length()
+    def _pad_to_multiple(num, base):
+        return ((num + base - 1) // base) * base
 
     def generate_perlin(self, batches) -> Tensor:
         """
@@ -382,12 +390,12 @@ class AnomalyGenerator(nn.Module):
             perlin_noise = rand_perlin_2d(
                 (self.perlin_height, self.perlin_width), (perlin_scalex, perlin_scaley)
             )
-            # original is power of 2 scale, so fit to our size
-            perlin_noise = F.interpolate(
-                perlin_noise.reshape(1, 1, self.perlin_height, self.perlin_width),
-                size=(self.height, self.width),
-                mode="bilinear",
-                align_corners=False,
+            # crop the oversized canvas down to the true feature-map size instead
+            # of resizing — a crop preserves the noise's true aspect ratio/scale,
+            # whereas F.interpolate would squish it non-uniformly whenever
+            # (perlin_height, perlin_width) != (height, width)
+            perlin_noise = perlin_noise[: self.height, : self.width].reshape(
+                1, 1, self.height, self.width
             )
             threshold = self.config["perlin_thr"]
             # binarize
