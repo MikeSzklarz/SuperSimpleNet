@@ -345,6 +345,7 @@ def train(
     eval_step_size: int = 4,
     use_amp: bool = False,
     exp: "ExperimentDir" = None,
+    skip_pixel_metrics: bool = False,
 ):
     log = get_logger()
     model.to(device)
@@ -505,6 +506,7 @@ def train(
                     image_metrics=image_metrics,
                     pixel_metrics=pixel_metrics,
                     normalize=True,
+                    skip_pixel_metrics=skip_pixel_metrics,
                 )
                 if exp is not None:
                     exp.append_metrics_history(epoch + 1, results)
@@ -534,6 +536,7 @@ def test(
     image_save_path: Path = None,
     score_save_path: Path = None,
     exp: "ExperimentDir" = None,
+    skip_pixel_metrics: bool = False,
 ):
     log = get_logger()
     model.to(device)
@@ -619,21 +622,29 @@ def test(
         results_dict[name] = metric.to(device).compute().item()
         metric.to("cpu")
 
-    for name, metric in pixel_metrics.items():
-        try:
-            # avoid nan in early stages
-            am = results["anomaly_map"]
-            am[am != am] = 0
-            results["anomaly_map"] = am
+    if skip_pixel_metrics:
+        # Weakly supervised: pixel-level ground truth (even when present on disk)
+        # isn't a fair target -- masks were never used to train the model, so
+        # localization metrics don't measure anything meaningful here. Report NA
+        # rather than a number that looks like a real score.
+        for name in pixel_metrics:
+            results_dict[name] = float("nan")
+    else:
+        for name, metric in pixel_metrics.items():
+            try:
+                # avoid nan in early stages
+                am = results["anomaly_map"]
+                am[am != am] = 0
+                results["anomaly_map"] = am
 
-            metric.update(
-                results["anomaly_map"], results["gt_mask"].type(torch.float32)
-            )
-            results_dict[name] = metric.to(device).compute().item()
-        except RuntimeError:
-            # AUPRO in some cases with early predictions crashes cuda, so just skip it in that case
-            results_dict[name] = 0
-        metric.to("cpu")
+                metric.update(
+                    results["anomaly_map"], results["gt_mask"].type(torch.float32)
+                )
+                results_dict[name] = metric.to(device).compute().item()
+            except RuntimeError:
+                # AUPRO in some cases with early predictions crashes cuda, so just skip it in that case
+                results_dict[name] = 0
+            metric.to("cpu")
 
     log.info("  ┌─────────────────────────────┐")
     for name, value in results_dict.items():
@@ -762,6 +773,11 @@ def train_and_eval(model, datamodule, config, device, exp: ExperimentDir):
         "AUPRO": AUPRO(),
         "AP-loc": AveragePrecision(num_classes=1),
     }
+    skip_pixel_metrics = config.get("supervision_str") == Supervision.WEAKLY_SUPERVISED.value
+    if skip_pixel_metrics:
+        log.info("  Supervision is weakly_supervised: pixel-level metrics "
+                 "(P-AUROC/AUPRO/AP-loc) will be reported as NA, even if ground "
+                 "truth masks are present -- they were never used for training.")
 
     train(
         model=model,
@@ -774,6 +790,7 @@ def train_and_eval(model, datamodule, config, device, exp: ExperimentDir):
         eval_step_size=config["eval_step_size"],
         use_amp=config.get("use_amp", False),
         exp=exp,
+        skip_pixel_metrics=skip_pixel_metrics,
     )
     if LOG_WANDB:
         wandb.finish()
@@ -791,6 +808,7 @@ def train_and_eval(model, datamodule, config, device, exp: ExperimentDir):
         device=device,
         image_metrics=image_metrics,
         pixel_metrics=pixel_metrics,
+        skip_pixel_metrics=skip_pixel_metrics,
         normalize=True,
         exp=exp,
     )
