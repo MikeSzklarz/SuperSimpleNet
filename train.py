@@ -382,6 +382,15 @@ def train(
         epoch_synth_area_sum = 0.0
         epoch_synth_batches = 0
         epoch_batches_no_positive = 0
+        # per-component loss tracking: `loss` is good_loss + bad_loss + focal_val
+        # (seg) + cls_loss, but only the sum was ever logged, which hides
+        # whether a stalled avg_loss is the seg branch or the cls branch not
+        # learning -- log each term's epoch mean separately.
+        epoch_good_loss_sum = 0.0
+        epoch_bad_loss_sum = 0.0
+        epoch_focal_val_sum = 0.0
+        epoch_seg_loss_sum = 0.0
+        epoch_cls_loss_sum = 0.0
         log.info("─── Training: Epoch %d / %d ──────────────────────────────────", epoch + 1, epochs)
 
         with tqdm(
@@ -473,7 +482,8 @@ def train(
                     # seg loss is combination of trunc l1 and focal (separately avg each l1 part due to unbalanced pixels)
                     seg_loss = good_loss + bad_loss + focal_val
 
-                    loss = seg_loss + focal_loss(score, label)
+                    cls_loss = focal_loss(score, label)
+                    loss = seg_loss + cls_loss
 
                 scaler.scale(loss).backward()
 
@@ -489,6 +499,13 @@ def train(
 
                 total_loss += loss.detach().cpu().item()
 
+                _lv = lambda x: x.item() if torch.is_tensor(x) else float(x)
+                epoch_good_loss_sum += _lv(good_loss)
+                epoch_bad_loss_sum += _lv(bad_loss)
+                epoch_focal_val_sum += _lv(focal_val)
+                epoch_seg_loss_sum += _lv(seg_loss)
+                epoch_cls_loss_sum += _lv(cls_loss)
+
                 output = {
                     "batch_loss": np.round(loss.data.cpu().detach().numpy(), 5),
                     "avg_loss": np.round(total_loss / (i + 1), 5),
@@ -499,6 +516,7 @@ def train(
                 prog_bar.update(1)
 
             avg_loss = total_loss / len(train_loader)
+            n_batches = len(train_loader)
             lrs = [pg["lr"] for pg in optimizer.param_groups]
             log.info(
                 "  Epoch %d done  |  avg_loss=%.5f  |  grad_norm=%s  |  lr(adapt/seg/dec)=%.6f/%.6f/%.6f",
@@ -507,19 +525,39 @@ def train(
                 f"{norm:.4f}" if norm is not None else "N/A",
                 lrs[0], lrs[1], lrs[2],
             )
+            loss_components = {
+                "seg_loss": epoch_seg_loss_sum / n_batches,
+                "seg_good_loss": epoch_good_loss_sum / n_batches,
+                "seg_bad_loss": epoch_bad_loss_sum / n_batches,
+                "seg_focal_loss": epoch_focal_val_sum / n_batches,
+                "cls_loss": epoch_cls_loss_sum / n_batches,
+            }
+            log.info(
+                "  Epoch %d loss components  |  seg=%.5f (good=%.5f bad=%.5f focal=%.5f)  |  cls=%.5f",
+                epoch + 1,
+                loss_components["seg_loss"], loss_components["seg_good_loss"],
+                loss_components["seg_bad_loss"], loss_components["seg_focal_loss"],
+                loss_components["cls_loss"],
+            )
+            synth_stats = None
             if epoch_synth_batches > 0:
+                synth_stats = {
+                    "synth_injected_area_pct": 100 * epoch_synth_area_sum / epoch_synth_batches,
+                    "synth_zero_positive_batches": epoch_batches_no_positive,
+                    "synth_total_batches": epoch_synth_batches,
+                }
                 log.info(
                     "  Epoch %d synth-anomaly stats  |  mean injected area=%.3f%%  |  "
                     "batches w/ zero positive samples=%d/%d (%.1f%%)",
                     epoch + 1,
-                    100 * epoch_synth_area_sum / epoch_synth_batches,
+                    synth_stats["synth_injected_area_pct"],
                     epoch_batches_no_positive, epoch_synth_batches,
                     100 * epoch_batches_no_positive / epoch_synth_batches,
                 )
             log.debug("  Epoch %d raw output: %s", epoch + 1, output)
 
             if exp is not None:
-                exp.append_loss(epoch + 1, avg_loss, lrs, norm)
+                exp.append_loss(epoch + 1, avg_loss, lrs, norm, loss_components, synth_stats)
 
             if (epoch + 1) % eval_step_size == 0:
                 log.info("─── Evaluation at Epoch %d / %d ──────────────────────────", epoch + 1, epochs)
@@ -549,7 +587,7 @@ def train(
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def _log_peak_concentration(results: dict, log: logging.Logger) -> None:
+def _log_peak_concentration(results: dict, log: logging.Logger) -> dict[str, float]:
     """Post-processing diagnostic: how spatially concentrated are predicted
     anomaly-map peaks across the test set?
 
@@ -558,11 +596,16 @@ def _log_peak_concentration(results: dict, log: logging.Logger) -> None:
     NORMAL images, which have nothing to localize -- means the model has
     learned to point at a fixed spatial location instead of image content.
     Split out normal vs. anomalous so a normal-only cluster is unmissable.
+
+    Returns a flat dict (merged into results_dict by the caller, so it rides
+    along on the existing metrics_history.csv persistence instead of needing
+    a separate file) so the trend across epochs is queryable later, not just
+    visible as text in training.log.
     """
     am = results["anomaly_map"].squeeze(1)  # [N, H, W]
     n_img, h_img, w_img = am.shape
     if n_img == 0:
-        return
+        return {}
     flat = am.reshape(n_img, -1)
     peak_idx = flat.argmax(dim=1)
     peak_y = (peak_idx // w_img).float()
@@ -587,22 +630,29 @@ def _log_peak_concentration(results: dict, log: logging.Logger) -> None:
 
     label_bool = results["label"].bool()
     groups = [
-        ("all", torch.ones(n_img, dtype=torch.bool)),
-        ("normal-only", ~label_bool),
-        ("anomalous-only", label_bool),
+        ("all", "all", torch.ones(n_img, dtype=torch.bool)),
+        ("normal-only", "normal", ~label_bool),
+        ("anomalous-only", "anom", label_bool),
     ]
 
     log.info("  Anomaly-map peak concentration (post-processing diagnostic):")
-    for name, sel in groups:
+    flat: dict[str, float] = {}
+    for name, key, sel in groups:
         s = _stats(sel)
         if s is None:
             log.info("    %-15s n=0", name)
-        else:
-            log.info(
-                "    %-15s n=%-4d  median_peak=(y=%.0f,x=%.0f)  peak_std=(%.1f,%.1f)px  "
-                "%.1f%% of peaks within 5%% of image diagonal from median",
-                name, s["n"], *s["median_peak"], *s["peak_std"], s["pct_within_5pct_diag"],
-            )
+            continue
+        log.info(
+            "    %-15s n=%-4d  median_peak=(y=%.0f,x=%.0f)  peak_std=(%.1f,%.1f)px  "
+            "%.1f%% of peaks within 5%% of image diagonal from median",
+            name, s["n"], *s["median_peak"], *s["peak_std"], s["pct_within_5pct_diag"],
+        )
+        flat[f"peak_{key}_median_y"] = s["median_peak"][0]
+        flat[f"peak_{key}_median_x"] = s["median_peak"][1]
+        flat[f"peak_{key}_std_y"] = s["peak_std"][0]
+        flat[f"peak_{key}_std_x"] = s["peak_std"][1]
+        flat[f"peak_{key}_concentration_pct"] = s["pct_within_5pct_diag"]
+    return flat
 
 
 @torch.no_grad()
@@ -691,7 +741,7 @@ def test(
             results["seg_score"].max() - results["seg_score"].min()
         )
 
-    _log_peak_concentration(results, log)
+    peak_stats = _log_peak_concentration(results, log)
 
     results_dict = {}
     for name, metric in image_metrics.items():
@@ -737,6 +787,12 @@ def test(
     for name, value in results_dict.items():
         print(f"{name}: {value} ", end="")
     print()
+
+    # merged after the printed table/legacy line (not part of the core
+    # detection metrics) so it still persists via metrics_history.csv without
+    # cluttering the console summary -- see _log_peak_concentration's own
+    # log lines above for the human-readable version.
+    results_dict.update(peak_stats)
 
     # Compute best-F1 threshold and per-image predicted labels
     max_f1_metric = image_metrics.get("I-MaxF1")

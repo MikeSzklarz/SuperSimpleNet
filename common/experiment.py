@@ -90,8 +90,22 @@ class ExperimentDir:
         row = {"epoch": epoch, **{k: round(float(v), 6) for k, v in metrics.items()}}
         _append_csv(self.logs / "metrics_history.csv", row)
 
-    def append_loss(self, epoch: int, avg_loss: float, lrs: list, grad_norm) -> None:
-        """Append one row to logs/losses.csv (called after each training epoch)."""
+    def append_loss(
+        self,
+        epoch: int,
+        avg_loss: float,
+        lrs: list,
+        grad_norm,
+        loss_components: dict | None = None,
+        synth_stats: dict | None = None,
+    ) -> None:
+        """Append one row to logs/losses.csv (called after each training epoch).
+
+        loss_components / synth_stats are optional epoch-mean breakdowns (seg
+        vs. cls loss terms, synthetic-anomaly injection stats) -- kept
+        optional so a stalled avg_loss can be attributed to a specific term
+        without re-deriving it from training.log text later.
+        """
         row = {
             "epoch": epoch,
             "avg_loss": round(avg_loss, 6),
@@ -100,6 +114,10 @@ class ExperimentDir:
             "lr_dec": round(lrs[2], 8) if len(lrs) > 2 else None,
             "grad_norm": round(float(grad_norm), 6) if grad_norm is not None else None,
         }
+        if loss_components:
+            row.update({k: round(v, 6) for k, v in loss_components.items()})
+        if synth_stats:
+            row.update({k: round(v, 6) if isinstance(v, float) else v for k, v in synth_stats.items()})
         _append_csv(self.logs / "losses.csv", row)
 
     def save_per_image_scores(self, rows: list[dict]) -> None:
