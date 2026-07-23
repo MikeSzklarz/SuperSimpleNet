@@ -339,6 +339,11 @@ class AnomalyGenerator(nn.Module):
 
         self.config = config
 
+        # per-batch stats from the most recent forward(), read by train.py for
+        # epoch-level synthesis logging. None until the first training batch.
+        self.last_injected_area_frac: float | None = None
+        self.last_batch_has_positive: bool | None = None
+
         # rand_perlin_2d needs canvas dims exactly divisible by the grid
         # resolution (res), and res is a power of two up to 2**(max_perlin_scale-1).
         # Pad each axis independently to a multiple of that largest possible res,
@@ -473,6 +478,10 @@ class AnomalyGenerator(nn.Module):
             perturbed_feat = features + noise * noise_mask
         else:
             perturbed_feat = None
+
+        # stats for train.py's per-epoch synthesis logging
+        self.last_injected_area_frac = noise_mask.detach().float().mean().item()
+        self.last_batch_has_positive = bool(labels.detach().sum().item() > 0)
 
         return perturbed_feat, perturbed_adapt, mask, labels
 

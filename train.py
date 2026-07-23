@@ -374,6 +374,14 @@ def train(
     for epoch in range(epochs):
         model.train()
         total_loss = 0
+        # pre-processing diagnostic: how much synthetic (Perlin+noise) anomaly
+        # area is actually being fed to the discriminator this epoch, and how
+        # many batches ended up with zero anomalous samples at all (relevant
+        # at small batch sizes / weak-mixed supervision, where an unlucky
+        # batch can starve the seg head of positive-class gradient signal).
+        epoch_synth_area_sum = 0.0
+        epoch_synth_batches = 0
+        epoch_batches_no_positive = 0
         log.info("─── Training: Epoch %d / %d ──────────────────────────────────", epoch + 1, epochs)
 
         with tqdm(
@@ -406,6 +414,13 @@ def train(
                     anomaly_map, score, mask, label = model.forward(
                         image_batch, mask, label
                     )
+
+                    gen_stats = model.anomaly_generator
+                    if gen_stats.last_injected_area_frac is not None:
+                        epoch_synth_area_sum += gen_stats.last_injected_area_frac
+                        epoch_synth_batches += 1
+                        if not gen_stats.last_batch_has_positive:
+                            epoch_batches_no_positive += 1
 
                     seg_focal = focal_loss(anomaly_map, mask, reduction=None)
 
@@ -492,6 +507,15 @@ def train(
                 f"{norm:.4f}" if norm is not None else "N/A",
                 lrs[0], lrs[1], lrs[2],
             )
+            if epoch_synth_batches > 0:
+                log.info(
+                    "  Epoch %d synth-anomaly stats  |  mean injected area=%.3f%%  |  "
+                    "batches w/ zero positive samples=%d/%d (%.1f%%)",
+                    epoch + 1,
+                    100 * epoch_synth_area_sum / epoch_synth_batches,
+                    epoch_batches_no_positive, epoch_synth_batches,
+                    100 * epoch_batches_no_positive / epoch_synth_batches,
+                )
             log.debug("  Epoch %d raw output: %s", epoch + 1, output)
 
             if exp is not None:
@@ -524,6 +548,62 @@ def train(
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
+
+def _log_peak_concentration(results: dict, log: logging.Logger) -> None:
+    """Post-processing diagnostic: how spatially concentrated are predicted
+    anomaly-map peaks across the test set?
+
+    A model doing genuine content-driven localization should have peaks
+    scattered around the image. Peaks clustering tightly -- especially for
+    NORMAL images, which have nothing to localize -- means the model has
+    learned to point at a fixed spatial location instead of image content.
+    Split out normal vs. anomalous so a normal-only cluster is unmissable.
+    """
+    am = results["anomaly_map"].squeeze(1)  # [N, H, W]
+    n_img, h_img, w_img = am.shape
+    if n_img == 0:
+        return
+    flat = am.reshape(n_img, -1)
+    peak_idx = flat.argmax(dim=1)
+    peak_y = (peak_idx // w_img).float()
+    peak_x = (peak_idx % w_img).float()
+    diag = (h_img**2 + w_img**2) ** 0.5
+
+    def _stats(sel: torch.Tensor) -> dict | None:
+        if sel.sum() == 0:
+            return None
+        py, px = peak_y[sel], peak_x[sel]
+        med_y, med_x = py.median(), px.median()
+        dist = ((py - med_y) ** 2 + (px - med_x) ** 2).sqrt()
+        return {
+            "n": int(sel.sum()),
+            "median_peak": (med_y.item(), med_x.item()),
+            "peak_std": (
+                py.std().item() if len(py) > 1 else 0.0,
+                px.std().item() if len(px) > 1 else 0.0,
+            ),
+            "pct_within_5pct_diag": (dist < 0.05 * diag).float().mean().item() * 100,
+        }
+
+    label_bool = results["label"].bool()
+    groups = [
+        ("all", torch.ones(n_img, dtype=torch.bool)),
+        ("normal-only", ~label_bool),
+        ("anomalous-only", label_bool),
+    ]
+
+    log.info("  Anomaly-map peak concentration (post-processing diagnostic):")
+    for name, sel in groups:
+        s = _stats(sel)
+        if s is None:
+            log.info("    %-15s n=0", name)
+        else:
+            log.info(
+                "    %-15s n=%-4d  median_peak=(y=%.0f,x=%.0f)  peak_std=(%.1f,%.1f)px  "
+                "%.1f%% of peaks within 5%% of image diagonal from median",
+                name, s["n"], *s["median_peak"], *s["peak_std"], s["pct_within_5pct_diag"],
+            )
+
 
 @torch.no_grad()
 def test(
@@ -610,6 +690,8 @@ def test(
         results["seg_score"] = (results["seg_score"] - results["seg_score"].min()) / (
             results["seg_score"].max() - results["seg_score"].min()
         )
+
+    _log_peak_concentration(results, log)
 
     results_dict = {}
     for name, metric in image_metrics.items():
@@ -717,11 +799,13 @@ def test(
         }
         visualizer = Visualizer(exp.visual)
         visualizer.visualize(results, outcome_dirs=outcome_dirs)
+        visualizer.save_aggregate_heatmap(results, exp.visual)
     else:
         if image_save_path:
             log.info("  Saving visualizations → %s", image_save_path)
             visualizer = Visualizer(image_save_path)
             visualizer.visualize(results)
+            visualizer.save_aggregate_heatmap(results, image_save_path)
 
         if score_save_path:
             score_save_path.mkdir(exist_ok=True, parents=True)

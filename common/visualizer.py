@@ -55,13 +55,17 @@ def _overlay_mask(image: np.ndarray, mask: np.ndarray, color: tuple, fill_alpha:
 
 def _overlay_heatmap(image: np.ndarray, anomaly_map: np.ndarray, max_alpha: float = 0.75) -> np.ndarray:
     """Composite the anomaly map onto a float RGB image ([0,1]) using the
-    `turbo` colormap with per-pixel alpha driven by the score itself, so
-    low-anomaly regions stay close to the original photo and only genuinely
-    anomalous regions are tinted (Grad-CAM style).
+    `turbo` colormap, with color and per-pixel alpha driven by the map after
+    a per-image min/max stretch rather than the raw score. Raw anomaly
+    scores rarely approach 1.0 even at genuine defects, so gating on the raw
+    value left the overlay faint everywhere, hotspot included; stretching to
+    the image's own range guarantees the hottest pixel always reads as fully
+    saturated/opaque while low-relevance regions stay close to the photo.
     """
-    clipped = np.clip(anomaly_map, 0.0, 1.0)
-    heat_rgba = _TURBO(clipped).astype(np.float32)
-    alpha = (clipped * max_alpha)[..., None]
+    lo, hi = anomaly_map.min(), anomaly_map.max()
+    normalized = (anomaly_map - lo) / (hi - lo) if hi > lo else np.zeros_like(anomaly_map)
+    heat_rgba = _TURBO(normalized).astype(np.float32)
+    alpha = (normalized * max_alpha)[..., None]
     return image * (1 - alpha) + heat_rgba[..., :3] * alpha
 
 
@@ -177,3 +181,43 @@ class Visualizer:
             cv2.imwrite(str(ano_maps_dir / plot_name), anomaly_map * 255)
 
             plt.close("all")
+
+    def save_aggregate_heatmap(self, results: dict, save_path: Path) -> None:
+        """Average every predicted anomaly map in the test set (all / normal-only
+        / anomalous-only) into one image per group.
+
+        A hotspot that survives averaging over many unrelated images is a
+        fixed spatial bias, not something driven by image content -- this is
+        the fastest way to see that at a glance, especially for the
+        normal-only panel (nothing there should be "anomalous" at all).
+        """
+        anomaly_maps = results["anomaly_map"].squeeze(1).numpy()  # [N, H, W]
+        labels = results["label"].numpy()
+
+        groups = [
+            ("All test images", anomaly_maps),
+            ("Normal only", anomaly_maps[labels == 0]),
+            ("Anomalous only", anomaly_maps[labels == 1]),
+        ]
+
+        fig, plots = plt.subplots(1, len(groups), figsize=(4.5 * len(groups), 4.5))
+        for ax, (title, maps) in zip(plots, groups):
+            ax.axis("off")
+            if len(maps) == 0:
+                ax.set_title(f"{title}\n(no images)", fontsize=_TITLE_FONTSIZE)
+                continue
+            mean_map = maps.mean(axis=0)
+            im = ax.imshow(mean_map, cmap=_TURBO, vmin=0, vmax=max(mean_map.max(), 1e-6))
+            ax.set_title(f"{title}  (n={len(maps)})", fontsize=_TITLE_FONTSIZE)
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        fig.suptitle(
+            "Mean predicted anomaly map across test set\n"
+            "(a hotspot that survives averaging = fixed-location bias, not content-driven)",
+            fontsize=_SUPTITLE_FONTSIZE,
+        )
+        fig.tight_layout()
+
+        save_path.mkdir(exist_ok=True, parents=True)
+        fig.savefig(save_path / "_aggregate_heatmap.png", bbox_inches="tight", dpi=150)
+        plt.close(fig)
